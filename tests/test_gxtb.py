@@ -62,6 +62,7 @@ def _restore_cache():
 def test_missing_binary_message(monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.delenv(gxtb.ENV_VAR, raising=False)
+    monkeypatch.setattr(gxtb.gxtb_install, "installed_binary", lambda: None)  # nor a copy installed by the app
     gxtb._cache.clear()
     with pytest.raises(ChemError, match="g-xTB was not found"):
         gxtb.optimize(WATER)
