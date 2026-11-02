@@ -10,6 +10,26 @@ the window talks only to the minimol process on your own machine.
 
 ## Install and run
 
+### Windows
+
+Download `minimol-<version>-setup.exe`:
+* from the repository's **Releases** page, or
+* from the latest run of the **Windows installer** workflow in the **Actions**
+  tab (the artifact is a zip that contains it).
+
+Run it. It installs for your user account only, so no administrator rights are
+needed, and adds minimol to the Start menu. It can also add a desktop icon and
+offer minimol in "Open with" for molecule files. Uninstall it from Windows
+Settings › Apps.
+
+* **Unsigned installer:** Windows SmartScreen may say it "protected your PC".
+  Choose *More info › Run anyway*. Signing would need a paid code-signing
+  certificate.
+* **Download size:** the program is large (about 800 MB installed, most of it
+  Qt's built-in Chromium). The installer is smaller because it is compressed.
+
+### With Python (Linux, macOS, Windows)
+
 Requires Python 3.10 or newer.
 
 ```bash
@@ -31,8 +51,12 @@ minimol molecule.xyz       # open a file straight away
   there too in Chromium (tested); other browsers may reload the page instead,
   so use the Optimize button.
 * `--software-gl` lets the window draw without a usable GPU (virtual
-  machines, remote desktops). Use it if the window says 3D graphics could not
-  start. This was verified on Linux only.
+  machines, remote desktops, WSL). Use it if the window says 3D graphics could
+  not start. On Linux without `/dev/dri` it also turns off Chromium's GPU
+  compositor, which otherwise leaves the window blank. This was verified on
+  Linux only.
+* `--self-test report.json` checks an installation (chemistry, the editor's
+  files, and with `--self-test-window` the window itself) and writes a report.
 
 ### Optional: g-xTB
 
@@ -40,7 +64,18 @@ minimol molecule.xyz       # open a file straight away
 Froitzheim, Müller, Hansen, Grimme, ChemRxiv 2025, DOI
 10.26434/chemrxiv-2025-bjxv) is a semiempirical method for H–Lr. It is
 distributed as a modified `xtb` binary under the GPL-3.0. minimol does **not**
-bundle it; it runs it as a separate program if you install it:
+bundle it; it runs it as a separate program if you install it.
+
+**Easiest:** click **Install g-xTB…** next to the method menu.
+* minimol downloads the official archive for your system (Windows x64,
+  Linux x86-64, macOS) from the g-xTB repository, pinned to the 2.0.1 commit
+  `23f81c2`.
+* It checks the archive against the SHA-256 published there and unpacks it
+  into your user data folder (`%LOCALAPPDATA%\minimol\g-xtb` on Windows).
+* Only the Linux download has been tried for real so far; the Windows one is
+  exercised by the Windows build.
+
+**By hand:**
 
 1. Download the archive for your OS from the `binaries/` folder of
    https://github.com/grimme-lab/g-xtb and check it against its `.sha256` file.
@@ -57,7 +92,9 @@ bundle it; it runs it as a separate program if you install it:
    to the binary (see the g-xTB README).
 3. Restart minimol. "g-xTB" now appears in the method list.
 
-minimol only accepts a binary whose `--help` lists `--gxtb`. It runs
+minimol looks for g-xTB in this order: `MINIMOL_GXTB`, `gxtb` on `PATH`, the
+copy installed by the button, then `xtb` on `PATH`. It only accepts a binary
+whose `--help` lists `--gxtb`. It runs
 `xtb in.xyz --gxtb --opt --norestart --chrg <sum of formal charges>` in a
 temporary folder; atoms marked "fix selected" become an xcontrol `$fix` block.
 Tested with g-xTB 2.0.1 (xtb 6.7.1, built 2026-05-14) on Linux x86-64.
@@ -121,7 +158,14 @@ in details. The sidebar lists every key.
   * `1`/`2`/`3` set the order.
   * `a` fuses a benzene ring.
   * `v`, `4`, `5`, `6`, `7`, `8` fuse a 3- to 8-membered ring.
-  * Rings go on the side of the bond with the most room.
+  * **Like ChemDraw, a fused ring takes in neighbouring atoms that sit where
+    its corners would be.** On the bond between two rings it is fused to both
+    (biphenyl → phenanthrene, N-phenylpyrrole → pyrrolo[1,2-a]quinoline). On a
+    ring–CH₂ bond it goes through the ortho carbon.
+  * Atoms of a ring that already contains the bond are never reused, so on a
+    benzene edge you get naphthalene.
+  * Otherwise the ring goes on the side with the most room.
+  * `a` gives the new ring a Kekulé pattern, without overloading any atom.
 * **On an atom:** `+`/`−` change the charge, Delete removes it.
 
 **The target moves on after each key**, so keys chain:
@@ -273,7 +317,23 @@ npm run e2e                     # drives the editor in Chromium with real mouse/
 
 * g-xTB tests skip when it is not installed. The desktop tests skip without
   PySide6 and run offscreen (`QT_QPA_PLATFORM=offscreen`).
-* `scripts/gen_elements.py` regenerates `static/js/elements.js` from RDKit's
+* Windows installer: `.github/workflows/windows.yml` builds and tests it on
+GitHub's Windows machines.
+* The program is built with PyInstaller (`packaging/minimol.spec`) and the
+  installer with Inno Setup (`packaging/windows/minimol.iss`).
+* The program is self-tested, window included, both as built and after a
+  silent install, and the uninstaller is checked.
+* To build by hand on Windows:
+
+  ```bash
+  pyinstaller --noconfirm --clean --distpath dist --workpath build packaging/minimol.spec
+  ```
+
+  ```bash
+  iscc /DAppVersion=0.4.0 packaging\windows\minimol.iss
+  ```
+
+`scripts/gen_elements.py` regenerates `static/js/elements.js` from RDKit's
   periodic table.
 
 ## Not included (yet)

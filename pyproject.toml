@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minimol"
-version = "0.3.0"
+version = "0.4.0"
 description = "A minimal desktop 3D molecule viewer and editor with fragment hotkeys, MMFF94/UFF and optional g-xTB optimization"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -27,7 +27,14 @@ def main(argv: list[str] | None = None) -> int:
         help="desktop window: allow software 3D rendering when the GPU is unavailable or blocked",
     )
     parser.add_argument("--version", action="version", version=f"minimol {__version__}")
+    parser.add_argument("--self-test", metavar="REPORT", help="check this installation and write a JSON report")
+    parser.add_argument("--self-test-window", action="store_true", help="with --self-test: also open the window")
     args = parser.parse_args(argv)
+
+    if args.self_test:
+        from . import selftest
+
+        return selftest.run(args.self_test, window=args.self_test_window, software_gl=args.software_gl)
 
     if args.file and not os.path.isfile(args.file):
         parser.error(f"no such file: {args.file}")
@@ -41,7 +48,8 @@ def main(argv: list[str] | None = None) -> int:
         ok, reason = desktop.available()
         if ok:
             return desktop.run(initial, args.port or 0, args.software_gl)
-        print(f"Desktop window unavailable ({reason}); opening in the browser instead.", file=sys.stderr)
+        if sys.stderr is not None:  # the windowed Windows program has no console
+            print(f"Desktop window unavailable ({reason}); opening in the browser instead.", file=sys.stderr)
 
     from .server import make_server
 

@@ -842,7 +842,16 @@ def _fragment(s: Session, op: dict, hint: np.ndarray | None) -> None:
 
 
 def _fuse(s: Session, op: dict, hint: np.ndarray | None) -> None:
-    """Fuse a ring onto the bond a-b, on its open side."""
+    """Fuse a ring onto the bond a-b, like ChemDraw.
+
+    Neighbours of a and b that sit where a ring atom would go (bond angle close
+    to the ring's interior angle, with a hydrogen or free valence to give up)
+    become part of the new ring: on biphenyl's central bond the ring runs
+    through both ortho carbons (phenanthrene); on a ring-CH2 bond it takes in
+    the ortho carbon. Atoms of a ring that already contains the bond are never
+    reused, so on a benzene edge the ring goes outwards (naphthalene).
+    Otherwise all ring atoms are new and the ring goes where there is most room.
+    """
     a = s.check_atom(op.get("a"))
     b = s.check_atom(op.get("b"))
     size = _integer(op.get("size"), "size")
@@ -856,38 +865,158 @@ def _fuse(s: Session, op: dict, hint: np.ndarray | None) -> None:
         raise ChemError("These atoms are not bonded")
     if s.is_h(a) or s.is_h(b):
         raise ChemError("Rings can only be fused onto a bond between two heavy atoms")
-    order_ab = _ORDER_OF.get(bond.GetBondType(), 1)
-    if order_ab == 3:
+    if _ORDER_OF.get(bond.GetBondType(), 1) == 3:
         raise ChemError("A ring cannot be fused onto a triple bond")
 
-    pa, pb = s.pos(a), s.pos(b)
-    length = float(np.linalg.norm(pb - pa))
-    u = _unit(pb - pa)
+    pa_, pb_ = s.pos(a), s.pos(b)
+    length = float(np.linalg.norm(pb_ - pa_))
+    u = _unit(pb_ - pa_)
     if u is None:
         raise ChemError("The two atoms are on top of each other")
-    mid = (pa + pb) / 2
+    mid = (pa_ + pb_) / 2
     apothem = length / (2 * math.tan(math.pi / size))
     radius = length / (2 * math.sin(math.pi / size))
     start = math.atan2(-apothem, length / 2)  # angle of b seen from the centre, in the (u, side) basis
 
-    def ring_points(side: np.ndarray) -> list[np.ndarray]:
+    def polygon(side: np.ndarray) -> list[np.ndarray]:
+        """Ideal ring vertices after b, going round to the vertex before a (size - 2 points)."""
         center = mid + side * apothem
-        normal = np.cross(u, side)
-        pts = []
-        for k in range(1, size - 1):
-            t = start + k * 2 * math.pi / size
-            p = center + radius * (math.cos(t) * u + math.sin(t) * side)
-            if not s.flat and not aromatic and size >= 5:
-                p = p + normal * (0.25 if k % 2 else -0.25)  # pucker so optimization does not sit on a flat ring
-            pts.append(p)
+        return [
+            center + radius * (math.cos(start + k * 2 * math.pi / size) * u + math.sin(start + k * 2 * math.pi / size) * side)
+            for k in range(1, size - 1)
+        ]
+
+    def side_towards(p: np.ndarray) -> np.ndarray | None:
+        v = p - mid
+        return _unit(v - u * float(np.dot(v, u)))
+
+    partner_a, partner_b = _fusion_partners(s, a, b, size)
+    if partner_a is not None or partner_b is not None:
+        # Ring through existing neighbours: the side is set by those atoms.
+        anchors = [s.pos(x) for x in (partner_a, partner_b) if x is not None]
+        side = side_towards(sum(anchors) / len(anchors))
+        verts = polygon(side)  # verts[0] is next to b, verts[-1] next to a
+        inner = verts[(1 if partner_b is not None else 0) : (len(verts) - 1 if partner_a is not None else len(verts))]
+        # Shift the new atoms so they bond sensibly to where the reused atoms really are.
+        shift_b = s.pos(partner_b) - verts[0] if partner_b is not None else np.zeros(3)
+        shift_a = s.pos(partner_a) - verts[-1] if partner_a is not None else np.zeros(3)
+        new = []
+        for k, p in enumerate(inner):
+            t = (k + 1) / (len(inner) + 1)
+            new.append(s.add_atom("C", p + shift_b * (1 - t) + shift_a * t))
+        ring = [b, *([partner_b] if partner_b is not None else []), *new, *([partner_a] if partner_a is not None else []), a]
+    else:
+        new = _fuse_new_atoms(s, a, b, size, aromatic, hint, polygon, u, mid)
+        ring = [b, *new, a]
+
+    edges = [(ring[k], ring[(k + 1) % len(ring)]) for k in range(len(ring))]  # closes back to b
+    missing = [(x, y) for x, y in edges if s.mol.GetBondBetweenAtoms(x, y) is None]
+    if aromatic:
+        # New bonds, and existing chain bonds of the new ring, get a Kekule pattern;
+        # bonds that already belong to a ring keep their order.
+        in_rings = _ring_bonds(s)
+        chain = [(x, y) for x, y in edges if (x, y) not in missing and frozenset((x, y)) not in in_rings]
+        orders = _kekule_orders(s, ring, missing, chain)
+        for (x, y), order in zip(chain, orders[len(missing):]):
+            s.mol.GetBondBetweenAtoms(x, y).SetBondType(_ORDER[order])
+    else:
+        orders = [1] * len(missing)
+    for (x, y), order in zip(missing, orders):
+        s.add_bond(x, y, order)
+    for x in ring:
+        s.mark_adjust(x)
+    s.set_focus(None)
+
+
+def _ring_bonds(s: Session) -> set[frozenset]:
+    probe = Chem.RWMol(s.mol)
+    probe.UpdatePropertyCache(strict=False)
+    out = set()
+    for ring in Chem.GetSymmSSSR(probe):
+        ring = list(ring)
+        for k in range(len(ring)):
+            out.add(frozenset((ring[k], ring[(k + 1) % len(ring)])))
+    return out
+
+
+def _fusion_partners(s: Session, a: int, b: int, size: int) -> tuple[int | None, int | None]:
+    """Neighbours of a and b that the new ring should take in (see _fuse)."""
+    interior = 180.0 * (size - 2) / size
+    probe = Chem.RWMol(s.mol)
+    probe.UpdatePropertyCache(strict=False)
+    in_same_ring = set()
+    for ring in Chem.GetSymmSSSR(probe):
+        if a in ring and b in ring:
+            in_same_ring.update(ring)
+
+    def angle(center: int, x: int, y: int) -> float:
+        v1, v2 = _unit(s.pos(x) - s.pos(center)), _unit(s.pos(y) - s.pos(center))
+        return math.degrees(math.acos(max(-1.0, min(1.0, float(np.dot(v1, v2))))))
+
+    def candidates(x: int, other: int) -> list[int]:
+        out = []
+        for c in s.heavy_neighbors(x):
+            if c in (a, b) or c in in_same_ring:
+                continue
+            if not (s.h_neighbors(c) or s.open_valence(c) > 0):
+                continue  # no room for another bond
+            if abs(angle(x, other, c) - interior) <= 15:
+                out.append(c)
+        return out
+
+    cand_a, cand_b = candidates(a, b), candidates(b, a)
+    if size >= 5:
+        pairs = []
+        for pa in cand_a:
+            for pb in cand_b:
+                if pa == pb or s.mol.GetBondBetweenAtoms(pa, pb) is not None:
+                    continue
+                dihedral = abs(_dihedral(s.pos(pa), s.pos(a), s.pos(b), s.pos(pb)))
+                if dihedral < 70:
+                    pairs.append((dihedral, pa, pb))
+        if pairs:
+            _, pa, pb = min(pairs)
+            return pa, pb
+    if size >= 4:
+        # With one partner, the other end gains a new bond, so it needs room for one
+        # (ring - CH2 bond of ethylbenzene: go through the ortho CH, not the CH3).
+        def free(x: int) -> bool:
+            return bool(s.h_neighbors(x)) or s.open_valence(x) > 0
+
+        singles = [(c, None) for c in cand_a if free(b)] + [(None, c) for c in cand_b if free(a)]
+        if singles:
+            # Several (e.g. the two ortho carbons): prefer the one with more room around it.
+            def room(choice):
+                c = choice[0] if choice[0] is not None else choice[1]
+                return min(
+                    (float(np.linalg.norm(s.pos(c) - s.pos(j))) for j in range(s.mol.GetNumAtoms())
+                     if j not in (a, b, c) and not s.is_h(j) and j not in s.heavy_neighbors(c)),
+                    default=math.inf,
+                )
+            return max(singles, key=room)
+    return None, None
+
+
+def _dihedral(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
+    b0, b1, b2 = p1 - p0, p2 - p1, p3 - p2
+    n1, n2 = np.cross(b0, b1), np.cross(b1, b2)
+    m1 = np.cross(n1, _unit(b1) if _unit(b1) is not None else b1)
+    return math.degrees(math.atan2(float(np.dot(m1, n2)), float(np.dot(n1, n2))))
+
+
+def _fuse_new_atoms(s, a, b, size, aromatic, hint, polygon, u, mid) -> list[int]:
+    """All-new ring atoms, on the side of the bond with the most room."""
+
+    def ring_points(side: np.ndarray) -> list[np.ndarray]:
+        pts = polygon(side)
+        if not s.flat and not aromatic and size >= 5:
+            normal = np.cross(u, side)
+            # Pucker, so an optimization does not sit on a flat ring.
+            pts = [p + normal * (0.25 if k % 2 == 0 else -0.25) for k, p in enumerate(pts)]
         return pts
 
-    # Candidate sides: both directions in the plane (2D), or turns about the bond (3D).
     base = _perpendicular(u, s.view.up if not s.flat else np.array([-u[1], u[0], 0.0]))
-    if s.flat:
-        sides = [base, -base]
-    else:
-        sides = [_axis_rotation(u, k * math.pi / 12) @ base for k in range(24)]
+    sides = [base, -base] if s.flat else [_axis_rotation(u, k * math.pi / 12) @ base for k in range(24)]
     # Hydrogens on a and b are re-derived (3D) and do not count as obstacles.
     ignore = {a, b} | (set(s.h_neighbors(a)) | set(s.h_neighbors(b)) if s.keep_h else set())
     others = [s.pos(j) for j in range(s.mol.GetNumAtoms()) if j not in ignore and j not in s.doomed]
@@ -909,21 +1038,51 @@ def _fuse(s: Session, op: dict, hint: np.ndarray | None) -> None:
         return (round(min(clearance, 3.0), 1), away)
 
     side = max(sides, key=score)
-    new = [s.add_atom("C", p) for p in ring_points(side)]
+    return [s.add_atom("C", p) for p in ring_points(side)]
 
-    ring = [b, *new, a]  # path from b round to a
-    if aromatic:
-        others_double = any(
-            _ORDER_OF.get(bd.GetBondType()) == 2 and bd.GetOtherAtomIdx(x) not in (a, b)
-            for x in (a, b)
-            for bd in s.mol.GetAtomWithIdx(x).GetBonds()
-        )
-        first = 1 if (order_ab == 2 or others_double) else 2
-        orders = [first if k % 2 == 0 else 3 - first for k in range(size - 1)]
-    else:
-        orders = [1] * (size - 1)
-    for k in range(size - 1):
-        s.add_bond(ring[k], ring[k + 1], orders[k])
-    for x in (a, b, *new):
-        s.mark_adjust(x)
-    s.set_focus(None)
+
+def _kekule_orders(s: Session, ring: list[int], missing: list[tuple[int, int]], chain: list[tuple[int, int]] = ()) -> list[int]:
+    """Orders for the new bonds (``missing``) and the re-assignable ``chain`` bonds of a fused benzene ring.
+
+    Tries every single/double choice and keeps the one that gives the most ring
+    atoms exactly one double bond, without two double bonds on an atom or any
+    atom over its valence (hydrogens are re-derived afterwards); among equally
+    good choices, the one that changes the fewest existing bonds.
+    """
+    import itertools
+
+    variable = list(missing) + list(chain)
+    variable_keys = {frozenset(e) for e in variable}
+
+    def fixed_doubles_and_valence(x: int) -> tuple[int, float]:
+        d, v = 0, 0.0
+        for bd in s.mol.GetAtomWithIdx(x).GetBonds():
+            other = bd.GetOtherAtomIdx(x)
+            if s.is_h(other) or frozenset((x, other)) in variable_keys:
+                continue
+            order = _ORDER_OF.get(bd.GetBondType(), 1)
+            d += order == 2
+            v += order
+        return d, v
+
+    base = {x: fixed_doubles_and_valence(x) for x in ring}
+    current = [None] * len(missing) + [_ORDER_OF.get(s.mol.GetBondBetweenAtoms(x, y).GetBondType(), 1) for x, y in chain]
+    limit = {}
+    for x in ring:
+        valences = _PT.GetValenceList(s.mol.GetAtomWithIdx(x).GetAtomicNum())
+        limit[x] = math.inf if -1 in valences else max(valences) + s.mol.GetAtomWithIdx(x).GetFormalCharge()
+    best, best_score = [1] * len(variable), None
+    for choice in itertools.product((2, 1), repeat=len(variable)):
+        doubles = {x: base[x][0] for x in ring}
+        valence = {x: base[x][1] for x in ring}
+        for (x, y), order in zip(variable, choice):
+            for z in (x, y):
+                doubles[z] += order == 2
+                valence[z] += order
+        if any(doubles[x] > 1 or valence[x] > limit[x] for x in ring):
+            continue
+        changed = sum(1 for c, o in zip(current, choice) if c is not None and c != o)
+        score = (sum(doubles[x] == 1 for x in ring), -changed)
+        if best_score is None or score > best_score:
+            best, best_score = list(choice), score
+    return best

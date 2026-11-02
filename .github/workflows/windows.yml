@@ -1,0 +1,92 @@
+# Builds the Windows installer, then tests it on a real Windows machine:
+# the program is self-tested (window included) as built and after a silent
+# install, and the uninstaller is checked. Run it from the Actions tab
+# ("Run workflow"); pushing a tag such as v0.4.0 also attaches the installer
+# to a GitHub release.
+name: Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # only used to create the release for a tag
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install minimol and the build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . pyinstaller pytest
+
+      - name: Install g-xTB the way the app does (download, checksum, unpack)
+        run: python -c "from minimol import gxtb_install; print(gxtb_install.install())"
+
+      - name: Tests (the desktop window is tested by the self-test below)
+        run: python -m pytest -q -rs --ignore=tests/test_desktop.py
+
+      - name: Build the program (PyInstaller)
+        run: pyinstaller --noconfirm --clean --distpath dist --workpath build packaging/minimol.spec
+
+      - name: Self-test the built program, window included
+        run: |
+          $p = Start-Process dist\minimol\minimol.exe -ArgumentList '--self-test', "$PWD\selftest-built.json", '--self-test-window' -Wait -PassThru
+          Get-Content selftest-built.json
+          if ($p.ExitCode -ne 0) { throw "self-test of the built program failed (exit $($p.ExitCode))" }
+
+      - name: Build the installer (Inno Setup)
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y }
+          $version = python -c "import minimol; print(minimol.__version__)"
+          & $iscc "/DAppVersion=$version" packaging\windows\minimol.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Get-ChildItem dist\minimol-*-setup.exe | Format-Table Name, Length
+
+      - name: Install silently and self-test the installed program
+        run: |
+          $setup = (Get-ChildItem dist\minimol-*-setup.exe | Select-Object -First 1).FullName
+          $p = Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer failed (exit $($p.ExitCode))" }
+          $exe = "$env:LOCALAPPDATA\Programs\minimol\minimol.exe"
+          if (-not (Test-Path $exe)) { throw "minimol.exe was not installed at $exe" }
+          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\minimol.lnk")) { throw "no Start menu shortcut" }
+          $p = Start-Process $exe -ArgumentList '--self-test', "$PWD\selftest-installed.json", '--self-test-window' -Wait -PassThru
+          Get-Content selftest-installed.json
+          if ($p.ExitCode -ne 0) { throw "self-test of the installed program failed (exit $($p.ExitCode))" }
+
+      - name: Uninstall silently
+        run: |
+          $p = Start-Process "$env:LOCALAPPDATA\Programs\minimol\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          Start-Sleep -Seconds 5
+          if (Test-Path "$env:LOCALAPPDATA\Programs\minimol\minimol.exe") { throw "uninstall left minimol.exe behind" }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: minimol-windows
+          path: |
+            dist/minimol-*-setup.exe
+            selftest-*.json
+          if-no-files-found: warn
+
+      - name: Attach the installer to a release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $setup = (Get-ChildItem dist\minimol-*-setup.exe | Select-Object -First 1).FullName
+          gh release create "${{ github.ref_name }}" "$setup" --title "minimol ${{ github.ref_name }}" --notes "Windows installer: download minimol-*-setup.exe and run it (no administrator rights needed)."

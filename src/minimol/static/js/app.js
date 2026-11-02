@@ -945,6 +945,39 @@ function showKeys(fragments, bondKeys) {
 
 // ------------------------------------------------------------ start-up
 
+function setMethods(info, select = null) {
+  const menu = $("method");
+  const keep = select || menu.value;
+  menu.textContent = "";
+  for (const m of info.methods) menu.add(new Option(m, m));
+  if (!info.methods.includes("g-xTB")) {
+    const opt = new Option("g-xTB (not installed)", "");
+    opt.disabled = true;
+    opt.title = info.gxtb_installable
+      ? "Use “Install g-xTB…” next to this menu."
+      : "Install g-xTB from github.com/grimme-lab/g-xtb as 'gxtb' on PATH, or set MINIMOL_GXTB.";
+    menu.add(opt);
+  }
+  if (info.methods.includes(keep)) menu.value = keep;
+  $("btn-gxtb").hidden = !info.gxtb_installable;
+  updateUI();
+}
+
+async function installGxtb() {
+  if (!canEdit()) return;
+  const ok = window.confirm(
+    "minimol will download g-xTB 2.0.1 (about 40 MB) from github.com/grimme-lab/g-xtb, " +
+      "check it against its published checksum and install it for your user account.\n\n" +
+      "g-xTB is GPL-3.0 software by the Grimme group (University of Bonn); it is not part of minimol. Continue?",
+  );
+  if (!ok) return;
+  const r = await busyCall("Downloading and installing g-xTB…", () => api("/api/install_gxtb"));
+  if (!r) return;
+  setMethods(r, "g-xTB");
+  setMessage(`g-xTB installed (${r.path}).`);
+}
+$("btn-gxtb").addEventListener("click", installGxtb);
+
 async function start() {
   updateUI();
   let info;
@@ -955,15 +988,7 @@ async function start() {
     return;
   }
   showKeys(info.fragments || [], info.bond_keys || []);
-  const select = $("method");
-  for (const m of info.methods) select.add(new Option(m, m));
-  if (!info.methods.includes("g-xTB")) {
-    const opt = new Option("g-xTB (not installed)", "");
-    opt.disabled = true;
-    opt.title = "Install g-xTB from github.com/grimme-lab/g-xtb as 'gxtb' on PATH, or set MINIMOL_GXTB.";
-    select.add(opt);
-  }
-  updateUI();
+  setMethods(info);
   try {
     const r = await api("/api/initial");
     if (r.molecule && commit(r.molecule, { view: "reset" })) {

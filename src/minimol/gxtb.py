@@ -9,7 +9,8 @@ The program is looked up in this order:
 
 1. the ``MINIMOL_GXTB`` environment variable (full path to the binary),
 2. a ``gxtb`` program on ``PATH``,
-3. an ``xtb`` program on ``PATH``.
+3. the copy minimol downloads on request (see gxtb_install.py),
+4. an ``xtb`` program on ``PATH``.
 
 A candidate is only used if its ``--help`` text lists the ``--gxtb`` flag, so a
 regular xtb without g-xTB support is never mistaken for it.
@@ -38,9 +39,13 @@ import subprocess
 import tempfile
 import threading
 
+from . import gxtb_install
 from .chem import ChemError, validate_json
 
 ENV_VAR = "MINIMOL_GXTB"
+# On Windows a console program started from a windowed app opens a console
+# window unless told not to.
+_NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 MAX_ATOMIC_NUMBER = 103  # g-xTB covers H to Lr
 OPT_LEVELS = ("crude", "sloppy", "loose", "normal", "tight", "verytight", "extreme")
 DEFAULT_TIMEOUT = 1800  # seconds
@@ -63,8 +68,10 @@ def _supports_gxtb(path: str) -> bool:
             [path, "--help"],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=30,
             stdin=subprocess.DEVNULL,
+            **_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -80,10 +87,9 @@ def find_binary(refresh: bool = False) -> str | None:
         env = os.environ.get(ENV_VAR)
         if env:
             candidates.append(os.path.expanduser(env))
-        for name in ("gxtb", "xtb"):
-            found = shutil.which(name)
+        for found in (shutil.which("gxtb"), gxtb_install.installed_binary(), shutil.which("xtb")):
             if found:
-                candidates.append(found)
+                candidates.append(str(found))
         path = None
         for candidate in candidates:
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK) and _supports_gxtb(candidate):
@@ -183,6 +189,7 @@ def optimize(
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
                     timeout=timeout,
+                    **_NO_WINDOW,
                 )
         except subprocess.TimeoutExpired:
             raise ChemError(f"g-xTB did not finish within {timeout:g} seconds") from None

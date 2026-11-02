@@ -1,0 +1,16 @@
+minimol is released under the MIT License (LICENSE). This program also contains
+the following software, each under its own license:
+
+* Python (PSF License Agreement) - https://www.python.org/
+* RDKit (BSD 3-Clause License) - https://www.rdkit.org/ , https://github.com/rdkit/rdkit
+* NumPy (BSD 3-Clause License) - https://numpy.org/
+* Qt 6 and Qt for Python / PySide6 (GNU LGPL version 3) - https://www.qt.io/ ,
+  https://doc.qt.io/qtforpython/ . Qt WebEngine includes Chromium, whose
+  third-party licenses are listed at https://doc.qt.io/qt-6/qtwebengine-licensing.html .
+  The Qt libraries are shipped as separate, unmodified DLLs, which you may replace
+  with other compatible builds of the same version.
+* three.js (MIT License) - https://threejs.org/ (static/vendor/three-LICENSE.txt)
+
+g-xTB (GPL-3.0, Grimme group, https://github.com/grimme-lab/g-xtb) is NOT part of
+this program. If you choose "Install g-xTB..." in minimol, it is downloaded from
+its official repository and installed separately in your user folder.

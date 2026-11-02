@@ -17,7 +17,9 @@ import sys
 import threading
 
 from .chem import ChemError
-from .server import make_server
+from .server import STATIC_DIR, make_server
+
+ICON = STATIC_DIR / "icon.png"
 
 
 def available() -> tuple[bool, str]:
@@ -31,6 +33,14 @@ def available() -> tuple[bool, str]:
 
 def _prepare_environment(software_gl: bool = False) -> None:
     """Set Qt WebEngine options; must run before the QApplication is created."""
+    if sys.platform == "win32":
+        # Own taskbar entry and icon (instead of being grouped as "Python").
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("minimol.minimol")
+        except (AttributeError, OSError):
+            pass
     # Chromium refuses to start its sandbox as root on Linux; without this
     # the window would stay blank. Normal user accounts keep the sandbox.
     if sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -39,9 +49,13 @@ def _prepare_environment(software_gl: bool = False) -> None:
     # start. Ignoring the GPU blocklist lets it use a software renderer
     # (verified with Mesa llvmpipe on Linux).
     if software_gl or os.environ.get("MINIMOL_SOFTWARE_GL") == "1":
-        flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
-        if "--ignore-gpu-blocklist" not in flags:
-            os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (flags + " --ignore-gpu-blocklist").strip()
+        flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").split()
+        wanted = ["--ignore-gpu-blocklist"]
+        if sys.platform.startswith("linux") and not os.path.exists("/dev/dri"):
+            # No GPU device (e.g. WSL): Chromium's GPU compositor then tries to
+            # share frames through dma_buf and the window stays blank.
+            wanted.append("--disable-gpu-compositing")
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(flags + [f for f in wanted if f not in flags])
 
 
 def make_clipboard_bridge():
@@ -215,9 +229,13 @@ def run(initial_file: str | None = None, port: int = 0, software_gl: bool = Fals
     server = make_server("127.0.0.1", port, initial_file)
     thread = threading.Thread(target=server.serve_forever, name="minimol-server", daemon=True)
     thread.start()
+    from PySide6.QtGui import QIcon
+
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("minimol")
     app.setApplicationDisplayName("minimol")
+    if ICON.exists():
+        app.setWindowIcon(QIcon(str(ICON)))
     server.clipboard = make_clipboard_bridge()
     window = create_window(server.url)
     window.show()

@@ -458,3 +458,74 @@ def test_over_valent_atoms_are_reported_in_3d():
     ], "bonds": [{"a": 0, "b": k, "order": 1} for k in range(1, 5)]}
     r = edit(m, keep_h=False, type="grow", atom=0, element="C")
     assert any("Too many bonds on C1" in n for n in r["notes"])
+
+
+# --------------------------------------- fusing next to existing rings (ChemDraw-like)
+
+
+def _smiles(mol):
+    from rdkit import Chem
+
+    rd = chem.mol_from_json(mol, sanitize=False)
+    for a in rd.GetAtoms():
+        a.SetNoImplicit(a.GetAtomicNum() == 1)
+    Chem.SanitizeMol(rd)  # also proves no atom is over its valence
+    return Chem.MolToSmiles(Chem.RemoveHs(rd))
+
+
+def _canon(smiles):
+    from rdkit import Chem
+
+    return Chem.MolToSmiles(Chem.MolFromSmiles(smiles))
+
+
+def _heavy_degree(mol, i):
+    return sum(1 for j in neighbors(mol, i) if mol["atoms"][j]["el"] != "H")
+
+
+def _molecule(smiles, dim):
+    from minimol import layout
+
+    return chem.from_smiles(smiles)[0] if dim == 3 else layout.smiles_2d(smiles)["molecule"]
+
+
+@pytest.mark.parametrize("dim", [3, 2])
+def test_benzene_fused_onto_a_bond_between_two_rings_joins_both(dim):
+    # The user's case: "a" on the bond linking two rings -> the new ring shares
+    # atoms with both rings (biphenyl -> phenanthrene), not a ring stuck on the side.
+    bp = _molecule("c1ccc(cc1)-c1ccccc1", dim)
+    b = next(b for b in bp["bonds"] if _heavy_degree(bp, b["a"]) == 3 and _heavy_degree(bp, b["b"]) == 3)
+    r = apply_edit(bp, {"type": "fuse", "a": b["a"], "b": b["b"], "size": 6, "aromatic": True}, dim=dim)
+    assert _smiles(r["molecule"]) == _canon("c1ccc2c(c1)ccc1ccccc12")
+    assert not r["notes"]
+
+
+@pytest.mark.parametrize("dim", [3, 2])
+def test_fusion_onto_a_bond_between_ring_and_heteroaromatic_ring(dim):
+    m = _molecule("c1ccn(c1)-c1ccccc1", dim)
+    b = next(
+        b for b in m["bonds"]
+        if {m["atoms"][b["a"]]["el"], m["atoms"][b["b"]]["el"]} == {"C", "N"}
+        and _heavy_degree(m, b["a"]) == 3 and _heavy_degree(m, b["b"]) == 3
+    )
+    r = apply_edit(m, {"type": "fuse", "a": b["a"], "b": b["b"], "size": 6, "aromatic": True}, dim=dim)
+    assert _smiles(r["molecule"]) == _canon("c1ccc2c(c1)ccc1cccn12")  # pyrrolo[1,2-a]quinoline
+
+
+def test_fusion_onto_ring_ch2_bond_goes_through_the_ortho_carbon_in_3d():
+    m = _molecule("CCc1ccccc1", 3)
+    b = next(
+        b for b in m["bonds"]
+        if {m["atoms"][b["a"]]["el"], m["atoms"][b["b"]]["el"]} == {"C"}
+        and sorted([_heavy_degree(m, b["a"]), _heavy_degree(m, b["b"])]) == [2, 3]
+    )
+    r = apply_edit(m, {"type": "fuse", "a": b["a"], "b": b["b"], "size": 6, "aromatic": True})
+    assert _smiles(r["molecule"]) == _canon("Cc1cccc2ccccc12")  # 1-methylnaphthalene, nothing over-valent
+
+
+def test_fusion_never_reuses_atoms_of_a_ring_that_contains_the_bond():
+    for dim in (3, 2):
+        m = _molecule("c1ccccc1", dim)
+        b = m["bonds"][0]
+        r = apply_edit(m, {"type": "fuse", "a": b["a"], "b": b["b"], "size": 6, "aromatic": True}, dim=dim)
+        assert _smiles(r["molecule"]) == _canon("c1ccc2ccccc2c1")

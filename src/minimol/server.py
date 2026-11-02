@@ -23,7 +23,7 @@ from pathlib import Path
 
 from rdkit import rdBase
 
-from . import __version__, chem, clipboard, edit, gxtb, layout
+from . import __version__, chem, clipboard, edit, gxtb, gxtb_install, layout
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY = 64 * 1024 * 1024  # bytes
@@ -166,6 +166,7 @@ def api_info(server: MinimolServer, body: dict) -> dict:
         "fragments": edit.fragment_list(),
         "bond_keys": edit.bond_key_list(),
         "cdx": clipboard.cdx_supported(),
+        "gxtb_installable": binary is None and gxtb_install.archive_for_this_computer() is not None,
         "system_clipboard": server.clipboard is not None,
     }
 
@@ -257,6 +258,15 @@ def api_optimize(server: MinimolServer, body: dict) -> dict:
         return chem.optimize(body.get("molecule"), method, body.get("max_iters") or 2000, fixed)
 
 
+def api_install_gxtb(server: MinimolServer, body: dict) -> dict:
+    with server.optimize_lock:  # not while a g-xTB run might be using the old copy
+        path = gxtb_install.install()
+    found = gxtb.find_binary(refresh=True)
+    if found is None:
+        raise chem.ChemError(f"g-xTB was installed at {path} but does not run on this computer.")
+    return {"path": str(path), **api_info(server, {})}
+
+
 def api_initial(server: MinimolServer, body: dict) -> dict:
     path = server.initial_file
     if not path:
@@ -280,6 +290,7 @@ ROUTES = {
     "/api/clean2d": api_clean2d,
     "/api/copy": api_copy,
     "/api/paste": api_paste,
+    "/api/install_gxtb": api_install_gxtb,
     "/api/optimize": api_optimize,
     "/api/initial": api_initial,
 }

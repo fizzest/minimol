@@ -10,6 +10,8 @@ from minimol.chem import ChemError
 
 BINARY = gxtb.find_binary(refresh=True)
 needs_gxtb = pytest.mark.skipif(BINARY is None, reason="g-xTB binary not installed")
+# Some tests stand in for g-xTB with small shell scripts, which Windows cannot run.
+needs_sh = pytest.mark.skipif(os.name == "nt", reason="uses a shell script as a stand-in for g-xTB")
 
 WATER = {
     "atoms": [
@@ -39,6 +41,7 @@ def _fake_binary(tmp_path, name, help_text, script=""):
     return str(path)
 
 
+@needs_sh
 def test_env_var_binary_must_support_gxtb(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path))
     plain = _fake_binary(tmp_path, "plain-xtb", "--gfn INT")
@@ -90,6 +93,7 @@ def test_read_xtbopt_checks_atoms():
         gxtb._read_xtbopt("2\n energy: 1\nO 0 0 0\nH 1 0 0\n", WATER["atoms"])
 
 
+@needs_sh
 def test_fake_binary_full_run(tmp_path, monkeypatch):
     """Exercise the file handling with a stand-in that mimics xtb's outputs."""
     script = textwrap.dedent(
@@ -108,6 +112,7 @@ def test_fake_binary_full_run(tmp_path, monkeypatch):
     assert result["molecule"]["atoms"][1]["x"] == 0.95
 
 
+@needs_sh
 def test_fake_binary_failure_is_reported(tmp_path):
     fake = _fake_binary(tmp_path, "gxtb", "--gxtb", "echo '-1- Error: SCF did not converge'\nexit 1\n")
     with pytest.raises(ChemError, match="g-xTB failed: Error: SCF did not converge"):
