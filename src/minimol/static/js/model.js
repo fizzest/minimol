@@ -49,10 +49,16 @@ export function totalCharge(m) {
   return m.atoms.reduce((s, a) => s + (a.charge || 0), 0);
 }
 
-/** Molecular formula in Hill order (C, H, then alphabetical; alphabetical if no C). */
+/**
+ * Molecular formula in Hill order (C, H, then alphabetical; alphabetical if no C).
+ * Counts implicit hydrogens (`h`, present on 2D drawings) as well as H atoms.
+ */
 export function formula(m) {
   const counts = new Map();
-  for (const a of m.atoms) counts.set(a.el, (counts.get(a.el) || 0) + 1);
+  for (const a of m.atoms) {
+    counts.set(a.el, (counts.get(a.el) || 0) + 1);
+    if (a.h) counts.set("H", (counts.get("H") || 0) + a.h);
+  }
   const keys = [...counts.keys()].sort();
   const order = counts.has("C")
     ? ["C", ...(counts.has("H") ? ["H"] : []), ...keys.filter((k) => k !== "C" && k !== "H")]

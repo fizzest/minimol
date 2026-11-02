@@ -5,7 +5,8 @@ The local server runs on a background thread inside this process and is only
 reachable from this machine. Keyboard shortcuts (Ctrl+R optimize, Ctrl+Z
 undo, ...) are handled by the editor itself, so they behave the same in the
 window and in a browser; inside this window nothing is bound to "reload".
-Saving goes through a native save dialog.
+Saving goes through a native save dialog, and copy/paste use the system
+clipboard (with all the formats ChemDraw may provide; see clipboard.py).
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import os
 import sys
 import threading
 
+from .chem import ChemError
 from .server import make_server
 
 
@@ -40,6 +42,62 @@ def _prepare_environment(software_gl: bool = False) -> None:
         flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
         if "--ignore-gpu-blocklist" not in flags:
             os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (flags + " --ignore-gpu-blocklist").strip()
+
+
+def make_clipboard_bridge():
+    """An object giving the server thread access to the system clipboard.
+
+    Qt only allows clipboard access from the GUI thread, while the server
+    answers requests on its own thread. The bridge sends each request to the
+    GUI thread through a queued signal and waits for the answer. It must be
+    created on the GUI thread, after the QApplication.
+    """
+    from PySide6.QtCore import QByteArray, QMimeData, QObject, Signal
+    from PySide6.QtGui import QGuiApplication
+
+    class ClipboardBridge(QObject):
+        _request = Signal(object)
+
+        def __init__(self):
+            super().__init__()
+            self._request.connect(self._handle)
+
+        def _handle(self, job):
+            try:
+                clip = QGuiApplication.clipboard()
+                if job["kind"] == "set":
+                    data = QMimeData()
+                    for fmt, raw in job["data"].items():
+                        if fmt == "text/plain":
+                            data.setText(raw.decode("utf-8"))
+                        else:
+                            data.setData(fmt, QByteArray(raw))
+                    clip.setMimeData(data)
+                    job["result"] = None
+                else:
+                    current = clip.mimeData()
+                    job["result"] = {f: current.data(f).data() for f in current.formats()} if current else {}
+            except Exception as exc:  # reported to the caller
+                job["error"] = exc
+            finally:
+                job["done"].set()
+
+        def _call(self, kind, data=None):
+            job = {"kind": kind, "data": data, "done": threading.Event()}
+            self._request.emit(job)
+            if not job["done"].wait(10):
+                raise ChemError("The system clipboard did not respond")
+            if "error" in job:
+                raise ChemError(f"Clipboard error: {job['error']}")
+            return job["result"]
+
+        def set(self, formats: dict[str, bytes]) -> None:
+            self._call("set", formats)
+
+        def get(self) -> dict[str, bytes]:
+            return self._call("get")
+
+    return ClipboardBridge()
 
 
 def create_window(url: str):
@@ -160,6 +218,7 @@ def run(initial_file: str | None = None, port: int = 0, software_gl: bool = Fals
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("minimol")
     app.setApplicationDisplayName("minimol")
+    server.clipboard = make_clipboard_bridge()
     window = create_window(server.url)
     window.show()
     try:

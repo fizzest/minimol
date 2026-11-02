@@ -40,7 +40,12 @@ after(async () => {
 });
 
 async function openEditor() {
-  const page = await browser.newPage({ viewport: { width: 1280, height: 800 }, acceptDownloads: true });
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 800 },
+    acceptDownloads: true,
+    permissions: ["clipboard-read", "clipboard-write"],
+  });
+  const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   // Chromium logs every HTTP error response; 400 is how the server reports
@@ -48,7 +53,7 @@ async function openEditor() {
   page.on("console", (m) => m.type() === "error" && !/status of 400/.test(m.text()) && errors.push(m.text()));
   await page.goto(url);
   await page.waitForFunction(() => document.querySelector("#method").options.length > 0);
-  const box = await page.locator("#viewport canvas").boundingBox();
+  const box = await page.locator("#viewport").boundingBox();
   const h = {
     page,
     errors,
@@ -66,6 +71,17 @@ async function openEditor() {
       const b = m.bonds[k];
       const [p, q] = await Promise.all([h.atomXY(b.a), h.atomXY(b.b)]);
       return { x: (p.x + q.x) / 2, y: (p.y + q.y) / 2 };
+    },
+    /** Index of a bond (matching `predicate`) that the mouse can hover at its midpoint. */
+    async visibleBond(predicate) {
+      const m = await h.model();
+      for (let k = 0; k < m.bonds.length; k++) {
+        if (!predicate(m.bonds[k], m)) continue;
+        const p = await h.bondXY(k);
+        const pick = await page.evaluate(({ x, y }) => window.__minimol.viewer.pick(x, y), p);
+        if (pick && pick.kind === "bond" && pick.index === k) return k;
+      }
+      throw new Error("no visible bond matches");
     },
     /** Index of an atom whose centre is not covered by anything closer to the camera. */
     async visibleAtom(predicate) {
@@ -189,9 +205,11 @@ test("drawing with hydrogens kept: grow, change element, bond orders, Ctrl+R, un
   assert.equal(await h.text("#energy"), "", "energy hidden after an edit");
 
   // Ctrl+drag a box around everything selects every atom; Delete removes them.
-  await page.mouse.move(h.box.x + 5, h.box.y + 5);
+  // (Measured now: the toolbar may have changed height since the page opened.)
+  const vb = await page.locator("#viewport").boundingBox();
+  await page.mouse.move(vb.x + 5, vb.y + 5);
   await page.keyboard.down("Control");
-  await h.drag({ x: h.box.x + 5, y: h.box.y + 5 }, { x: h.box.x + h.box.width - 5, y: h.box.y + h.box.height - 5 });
+  await h.drag({ x: vb.x + 5, y: vb.y + 5 }, { x: vb.x + vb.width - 5, y: vb.y + vb.height - 5 });
   await page.keyboard.up("Control");
   assert.equal((await page.evaluate(() => window.__minimol.state.selection.length)), 8);
   assert.match(await h.text("#measure"), /8 atoms selected/);
@@ -381,6 +399,150 @@ test("edits are refused while a calculation runs, so results never apply to a ch
   release();
   await page.waitForFunction(() => /kcal\/mol/.test(document.querySelector("#energy").textContent));
   assert.equal((await h.model()).atoms.length, 14);
+  assert.deepEqual(h.errors, []);
+  await page.close();
+});
+
+
+const isC = (m, i) => m.atoms[i].el === "C";
+const neighborsOf = (m, i) => m.bonds.filter((x) => x.a === i || x.b === i).map((x) => (x.a === i ? x.b : x.a));
+// A bond between two aromatic CH carbons (two ring neighbours and one H each).
+const ringBond = (b, m) =>
+  [b.a, b.b].every((i) => isC(m, i) && neighborsOf(m, i).filter((j) => isC(m, j)).length === 2 && neighborsOf(m, i).filter((j) => m.atoms[j].el === "H").length === 1);
+
+test("hotkeys as in ChemDraw: 3 turns a methyl into phenyl, bond keys fuse rings, keys work after the SMILES box and menus", async () => {
+  const h = await openEditor();
+  const { page } = h;
+  await page.fill("#smiles", "CC");
+  await page.press("#smiles", "Enter");
+  await h.waitFormula("C2H6");
+
+  // Typing in the SMILES box never triggers hotkeys...
+  await page.click("#smiles");
+  await h.hoverAtom(0);
+  await page.keyboard.type("c");
+  assert.equal(await page.inputValue("#smiles"), "c");
+  assert.equal(await h.formula(), "C2H6");
+  await page.fill("#smiles", "");
+  // ...and after using it (Enter) the keyboard goes back to the view.
+  await page.fill("#smiles", "C");
+  await page.press("#smiles", "Enter");
+  await h.waitFormula("C3H10");
+  await page.click("#btn-clear");
+  await page.fill("#smiles", "CC");
+  await page.press("#smiles", "Enter");
+  await h.waitFormula("C2H6");
+
+  // 3 on a CH3: that carbon becomes the phenyl ring -> toluene.
+  await h.hoverAtom(1);
+  await page.keyboard.press("3");
+  await h.idle();
+  assert.equal(await h.formula(), "C7H8");
+
+  // After choosing from a drop-down, hotkeys still reach the view.
+  await page.selectOption("#method", "UFF");
+  // a on a ring bond fuses a benzene ring -> methylnaphthalene.
+  const k = await h.visibleBond(ringBond);
+  const p = await h.bondXY(k);
+  await page.mouse.move(p.x, p.y);
+  await page.keyboard.press("a");
+  await h.idle();
+  assert.equal(await h.formula(), "C11H10");
+  // 6 on a ring bond of the new ring fuses a cyclohexane.
+  const k2 = await h.visibleBond(ringBond);
+  const p2 = await h.bondXY(k2);
+  await page.mouse.move(p2.x, p2.y);
+  await page.keyboard.press("6");
+  await h.idle();
+  assert.match(await h.formula(), /^C15H/);
+  await h.shot("20-fused");
+  assert.deepEqual(h.errors, []);
+  await page.close();
+});
+
+test("2D mode: draw like ChemDraw, hotkeys, clean up, to 3D and back, undo across modes", async () => {
+  const h = await openEditor();
+  const { page } = h;
+  await page.click("#mode-2d");
+  await page.waitForFunction(() => window.__minimol.model().dim === 2);
+  assert.equal(await page.isVisible("canvas.view2d"), true);
+
+  // Click empty space: a carbon (implicit H, shown as CH4).
+  await page.mouse.click(h.center.x - 100, h.center.y);
+  await h.waitFormula("CH4");
+  let m = await h.model();
+  assert.equal(m.atoms.length, 1, "no explicit hydrogens in 2D");
+  // Click the carbon twice: a zigzag chain.
+  await h.clickAtom(0);
+  await h.clickAtom(1);
+  await h.waitFormula("C3H8");
+  m = await h.model();
+  const v1 = [m.atoms[0].x - m.atoms[1].x, m.atoms[0].y - m.atoms[1].y];
+  const v2 = [m.atoms[2].x - m.atoms[1].x, m.atoms[2].y - m.atoms[1].y];
+  const angle = (Math.acos((v1[0] * v2[0] + v1[1] * v2[1]) / 2.25) * 180) / Math.PI;
+  assert.ok(Math.abs(angle - 120) < 0.01, `chain angle ${angle}`);
+
+  // Hotkeys in 2D: o on the end carbon -> ethanol; 3 on the other end carbon makes it a phenyl -> benzyl alcohol.
+  await h.hoverAtom(2);
+  await page.keyboard.press("o");
+  await h.waitFormula("C2H6O");
+  await h.hoverAtom(0);
+  await page.keyboard.press("3");
+  await h.waitFormula("C7H8O");
+  await h.shot("21-2d-drawing");
+
+  // Ctrl+R in 2D cleans the drawing up.
+  await page.mouse.move(h.center.x + 400, h.center.y + 250);
+  await page.keyboard.press("Control+r");
+  await page.waitForFunction(() => /Cleaned up/.test(document.querySelector("#message").textContent));
+  const drawing = await h.model();
+
+  // Tab: to 3D (hydrogens added, embedded), and back to the same drawing.
+  await page.keyboard.press("Tab");
+  await page.waitForFunction(() => window.__minimol.model().dim !== 2 && window.__minimol.model().atoms.length === 16);
+  await h.idle();
+  m = await h.model();
+  assert.ok(m.atoms.some((a) => Math.abs(a.z) > 0.3), "really 3D");
+  await h.shot("22-from-2d-to-3d");
+  await page.keyboard.press("Tab");
+  await page.waitForFunction(() => window.__minimol.model().dim === 2);
+  assert.deepEqual(await h.model(), drawing, "switching back restores the drawing exactly");
+
+  // Undo crosses the mode switch.
+  await page.keyboard.press("Control+z");
+  assert.notEqual((await h.model()).dim, 2);
+  await page.keyboard.press("Control+z");
+  assert.equal((await h.model()).dim, 2);
+  assert.deepEqual(h.errors, []);
+  await page.close();
+});
+
+test("clipboard: copy gives SMILES text, paste reads SMILES in 3D and 2D", async () => {
+  const h = await openEditor();
+  const { page } = h;
+  await page.fill("#smiles", "CCO");
+  await page.press("#smiles", "Enter");
+  await h.waitFormula("C2H6O");
+  await page.mouse.move(h.center.x + 400, h.center.y + 250);
+  await page.keyboard.press("Control+c");
+  await page.waitForFunction(() => /Copied/.test(document.querySelector("#message").textContent));
+  assert.equal(await page.evaluate(() => navigator.clipboard.readText()), "CCO");
+
+  await page.evaluate(() => navigator.clipboard.writeText("c1ccncc1"));
+  await page.keyboard.press("Control+v");
+  await h.waitFormula("C7H11NO");
+  assert.match(await h.text("#message"), /Pasted from SMILES/);
+
+  await page.click("#mode-2d");
+  await page.waitForFunction(() => window.__minimol.model().dim === 2);
+  await page.evaluate(() => navigator.clipboard.writeText("not a molecule at all"));
+  await page.keyboard.press("Control+v");
+  await page.waitForFunction(() => document.querySelector("#message").classList.contains("error"));
+  assert.match(await h.text("#message"), /Nothing on the clipboard/);
+  await page.evaluate(() => navigator.clipboard.writeText("C(=O)O"));
+  await page.keyboard.press("Control+v");
+  await h.waitFormula("C8H13NO3");
+  assert.ok((await h.model()).atoms.every((a) => a.z === 0));
   assert.deepEqual(h.errors, []);
   await page.close();
 });

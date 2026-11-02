@@ -9,15 +9,20 @@
 </head>
 <body>
   <header id="toolbar">
+    <div class="group seg" id="mode" role="group" aria-label="Mode">
+      <button id="mode-3d" data-edit title="3D: build and optimize in 3D">3D</button>
+      <button id="mode-2d" data-edit title="2D: skeletal drawing, like ChemDraw (Tab switches)">2D</button>
+    </div>
     <div class="group">
       <button id="btn-open" data-edit title="Open a molecule file (Ctrl+O)">Open…</button>
-      <input type="file" id="file-input" accept=".xyz,.mol,.sdf,.sd,.mol2,.pdb,.ent" hidden>
+      <input type="file" id="file-input" accept=".xyz,.mol,.sdf,.sd,.mol2,.pdb,.ent,.cdxml" hidden>
       <button id="btn-save" title="Save (Ctrl+S)">Save</button>
       <select id="save-format" title="File format for saving">
         <option value="xyz">.xyz</option>
         <option value="sdf">.sdf</option>
         <option value="mol">.mol</option>
         <option value="pdb">.pdb</option>
+        <option value="cdxml">.cdxml</option>
       </select>
     </div>
     <div class="group">
@@ -26,7 +31,7 @@
     </div>
     <form id="smiles-form" class="group">
       <input id="smiles" placeholder="SMILES, e.g. CC(=O)O" spellcheck="false" autocomplete="off" aria-label="SMILES">
-      <button type="submit" data-edit title="Build a 3D structure from SMILES and add it">Insert</button>
+      <button type="submit" data-edit title="Build the structure from SMILES and add it">Insert</button>
     </form>
     <div class="group">
       <button id="btn-addh" data-edit title="Fill every open valence with hydrogens">Add H</button>
@@ -76,21 +81,23 @@
         <p class="sub">The atom becomes</p>
         <div id="keys-replace" class="keys"></div>
         <p class="sub">On a bond</p>
-        <div class="keys"><span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> bond order</span></div>
+        <div id="keys-bond" class="keys"></div>
         <p class="sub">On an atom</p>
         <div class="keys"><span><kbd>+</kbd><kbd>−</kbd> charge</span><span><kbd>Del</kbd> delete</span></div>
-        <p>After a key, the new group becomes the target, so keys can be chained: on methane, <kbd>1</kbd><kbd>1</kbd><kbd>o</kbd> adds two carbons and turns the last one into OH (ethanol). Moving the mouse picks a new target.</p>
+        <p>After a key, the new group becomes the target, so keys can be chained: on methane, <kbd>1</kbd><kbd>1</kbd><kbd>o</kbd> adds two carbons and turns the last one into OH (ethanol); <kbd>3</kbd> on a CH₃ makes it a phenyl and targets the para carbon. Moving the mouse picks a new target.</p>
       </details>
       <details id="help">
         <summary>Mouse &amp; keys</summary>
         <ul>
-          <li><b>Rotate:</b> left-drag on empty space</li>
+          <li><b>2D / 3D:</b> toolbar switch or Tab. 2D is a skeletal drawing with implicit hydrogens; switching to 3D builds the structure and relaxes it</li>
+          <li><b>Rotate (3D):</b> left-drag on empty space. In 2D, left-drag on empty space selects</li>
           <li><b>Pan:</b> right-drag or Shift+drag</li>
           <li><b>Zoom:</b> mouse wheel / pinch</li>
           <li><b>Draw:</b> click empty space for a new atom; click an atom to grow a bond (replaces an H if the atom is full); drag from an atom to place one, or onto another atom to bond them; click an atom of another element to change it; click a bond to cycle single/double/triple</li>
           <li><b>Delete:</b> right-click an atom or bond (Draw or Delete tool), or click it with the Delete tool</li>
           <li><b>Select:</b> Ctrl+drag a box (Ctrl+Shift+drag adds); Ctrl+click toggles one atom; with the Select tool, click (Shift adds). 2/3/4 atoms show distance/angle/dihedral</li>
-          <li><b>Keys:</b> Ctrl+R optimize, Ctrl+Z / Ctrl+Shift+Z undo/redo, Del delete, Ctrl+A select all, Esc clear selection, R reset view</li>
+          <li><b>Clipboard:</b> Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste structures (with ChemDraw too; see the README for formats)</li>
+          <li><b>Keys:</b> Ctrl+R optimize (3D) or clean up (2D), Ctrl+Z / Ctrl+Shift+Z undo/redo, Del delete, Ctrl+A select all, Esc clear selection, R reset view</li>
         </ul>
       </details>
     </aside>

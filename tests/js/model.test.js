@@ -45,6 +45,9 @@ test("formula uses Hill order", () => {
   const salt = { atoms: [{ el: "Na" }, { el: "Cl" }], bonds: [] };
   assert.equal(M.formula(salt), "ClNa");
   assert.equal(M.formula(M.emptyModel()), "");
+  // 2D drawings carry implicit hydrogens in `h`.
+  const drawn = { atoms: [{ el: "C", h: 3 }, { el: "C", h: 2 }, { el: "O", h: 1 }], bonds: [] };
+  assert.equal(M.formula(drawn), "C2H6O");
 });
 
 test("model queries do not mutate their input", () => {

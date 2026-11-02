@@ -60,7 +60,7 @@ input[type="text"], input:not([type]), input[type="number"] {
   background: #fff;
 }
 
-#smiles { width: 180px; }
+#smiles { width: 150px; }
 #uhf { width: 64px; }
 label { display: flex; align-items: center; gap: 4px; color: var(--muted); user-select: none; }
 
@@ -187,3 +187,13 @@ kbd { font: 11px ui-monospace, monospace; color: var(--muted); }
   background: rgba(37, 99, 235, 0.08);
   pointer-events: none;
 }
+
+.seg { gap: 0; }
+.seg button { border-radius: 0; }
+.seg button:first-child { border-radius: 6px 0 0 6px; }
+.seg button:last-child { border-radius: 0 6px 6px 0; margin-left: -1px; }
+#viewport canvas.view2d { cursor: default; }
+#viewport.tool-draw canvas.view2d { cursor: crosshair; }
+
+/* The view takes keyboard focus when clicked (so hotkeys work); no focus ring around it. */
+#viewport canvas:focus { outline: none; }

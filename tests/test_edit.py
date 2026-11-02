@@ -252,11 +252,39 @@ def test_map_tracks_surviving_atoms():
 # -------------------------------------------------------------- fragments
 
 
-def test_attach_phenyl_to_methane():
-    r = edit(methane(), type="fragment", atom=0, key="3")
-    m = r["molecule"]
-    assert formula(m) == "C7H8"
-    sane(m)
+def test_3_on_a_methyl_turns_it_into_phenyl():
+    # The user's case: hover the CH3 of ethane, press 3 -> toluene (not benzyl-methyl).
+    m, c2 = ethane()
+    r = edit(m, type="fragment", atom=c2, key="3")
+    t = r["molecule"]
+    assert formula(t) == "C7H8"
+    sane(t)
+    # The target moves to the para carbon so key sequences continue from there.
+    para = r["focus"]
+    assert t["atoms"][para]["el"] == "C"
+    assert sum(1 for j in neighbors(t, para) if t["atoms"][j]["el"] == "H") == 1
+    assert d(t, 0, para) > 4.0  # far side of the ring from the original carbon
+
+
+def test_3_on_methane_gives_benzene():
+    assert formula(edit(methane(), type="fragment", atom=0, key="3")["molecule"]) == "C6H6"
+
+
+def test_1_adds_a_carbon_and_4_5_point_towards_and_away_from_the_viewer():
+    assert formula(edit(methane(), type="fragment", atom=0, key="1")["molecule"]) == "C2H6"
+    for key, sign in (("4", 1), ("5", -1)):
+        r = edit(methane(), type="fragment", atom=0, key=key)
+        new_c = r["focus"]
+        assert r["molecule"]["atoms"][new_c]["el"] == "C"
+        assert sign * r["molecule"]["atoms"][new_c]["z"] > 0.5  # default view looks down -z
+
+
+def test_group_key_on_an_internal_atom_adds_a_substituent():
+    propane, _ = chem.from_smiles("CCC")
+    r = edit(propane, type="fragment", atom=1, key="3")
+    assert formula(r["molecule"]) == "C9H12"  # isopropylbenzene
+    assert any("substituent" in n for n in r["notes"])
+    sane(r["molecule"])
 
 
 def test_label_key_on_terminal_carbon_replaces_it():
@@ -289,8 +317,8 @@ def test_label_key_inside_a_ring_changes_the_element():
     r = edit(ring, type="fragment", atom=0, key="o")
     assert formula(r["molecule"]) == "C5H10O"
     sane(r["molecule"])
-    with pytest.raises(ChemError, match="end atoms only"):
-        edit(ring, type="fragment", atom=0, key="F")
+    cf3 = edit(ring, type="fragment", atom=0, key="F")
+    assert formula(cf3["molecule"]) == "C7H11F3" and cf3["notes"]
     with pytest.raises(ChemError, match="cannot replace"):
         edit(ring, type="fragment", atom=0, key="f")
 
@@ -305,13 +333,13 @@ def test_chain_key_focus_moves_to_new_atom_and_vinyl_to_its_end():
     assert formula(r["molecule"]) == "C2H6" and r["molecule"]["atoms"][r["focus"]]["el"] == "C"
     r = edit(methane(), type="fragment", atom=0, key="8")
     m, f = r["molecule"], r["focus"]
-    assert formula(m) == "C3H6"
+    assert formula(m) == "C2H4"  # the carbon became a vinyl group: ethylene
     assert sum(1 for j in neighbors(m, f) if m["atoms"][j]["el"] == "H") == 2  # terminal =CH2
 
 
 def test_fragments_without_hydrogens_in_skeleton_mode():
     bare = {"atoms": [{"el": "C", "x": 0, "y": 0, "z": 0, "charge": 0}], "bonds": []}
-    assert formula(edit(bare, keep_h=False, type="fragment", atom=0, key="3")["molecule"]) == "C7"
+    assert formula(edit(bare, keep_h=False, type="fragment", atom=0, key="3")["molecule"]) == "C6"
 
 
 def test_fragment_avoids_clashes_with_existing_atoms():
@@ -355,3 +383,78 @@ def test_edit_errors():
         apply_edit(m, {"type": "grow", "atom": 0, "element": "C"}, view={"right": [0, 0, 0], "up": [0, 1, 0], "toCamera": [0, 0, 1]})
     with pytest.raises(ChemError, match="keep_h"):
         apply_edit(m, {"type": "grow", "atom": 0, "element": "C"}, keep_h="yes")
+
+
+# ------------------------------------------------------------- ring fusion
+
+
+def _cc_bond(mol, order=None):
+    for b in mol["bonds"]:
+        if mol["atoms"][b["a"]]["el"] == "C" and mol["atoms"][b["b"]]["el"] == "C" and (order is None or b["order"] == order):
+            return b["a"], b["b"]
+    raise AssertionError("no C-C bond")
+
+
+@pytest.mark.parametrize(
+    "smiles, size, aromatic, expected",
+    [
+        ("C1CCCCC1", 6, True, "C10H12"),  # tetralin
+        ("c1ccccc1", 6, True, "C10H8"),  # naphthalene
+        ("CC", 3, False, "C3H6"),  # cyclopropane
+        ("CC", 6, False, "C6H12"),  # cyclohexane
+        ("C1CCCC1", 5, False, "C8H14"),  # bicyclo[3.3.0]octane
+    ],
+)
+def test_fuse_ring_onto_bond(smiles, size, aromatic, expected):
+    mol, _ = chem.from_smiles(smiles)
+    a, b = _cc_bond(mol)
+    r = edit(mol, type="fuse", a=a, b=b, size=size, aromatic=aromatic)
+    assert formula(r["molecule"]) == expected
+    sane(r["molecule"])
+    result = chem.optimize(r["molecule"], "MMFF94")
+    assert math.isfinite(result["energy"])
+
+
+def test_fused_benzene_is_aromatic_by_rdkit():
+    from rdkit import Chem
+
+    mol, _ = chem.from_smiles("c1ccccc1")
+    a, b = _cc_bond(mol, order=1)
+    r = edit(mol, type="fuse", a=a, b=b, size=6, aromatic=True)
+    rd = chem.mol_from_json(r["molecule"])
+    assert Chem.MolToSmiles(Chem.RemoveHs(rd)) == "c1ccc2ccccc2c1"
+
+
+def test_fuse_errors():
+    mol, _ = chem.from_smiles("C#C")
+    a, b = _cc_bond(mol)
+    with pytest.raises(ChemError, match="triple"):
+        edit(mol, type="fuse", a=a, b=b, size=6, aromatic=True)
+    m = methane()
+    with pytest.raises(ChemError, match="heavy atoms"):
+        edit(m, type="fuse", a=0, b=1, size=6)
+    e, c2 = ethane()
+    with pytest.raises(ChemError, match="six-membered"):
+        edit(e, type="fuse", a=0, b=c2, size=5, aromatic=True)
+
+
+def test_bond_key_table_matches_edits():
+    from minimol.edit import BOND_KEYS
+
+    for key, spec in BOND_KEYS.items():
+        mol, _ = chem.from_smiles("CCCC")
+        a, b = 1, 2  # the middle C-C bond
+        if spec[0] == "order":
+            r = edit(mol, type="bond_order", a=a, b=b, order=spec[1])
+        else:
+            r = edit(mol, type="fuse", a=a, b=b, size=spec[1], aromatic=spec[2])
+        sane(r["molecule"])
+
+
+def test_over_valent_atoms_are_reported_in_3d():
+    m = {"atoms": [{"el": "C", "x": 0.0, "y": 0.0, "z": 0.0, "charge": 0}] + [
+        {"el": "C", "x": 1.5 * x, "y": 1.5 * y, "z": 1.5 * z, "charge": 0}
+        for x, y, z in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0))
+    ], "bonds": [{"a": 0, "b": k, "order": 1} for k in range(1, 5)]}
+    r = edit(m, keep_h=False, type="grow", atom=0, element="C")
+    assert any("Too many bonds on C1" in n for n in r["notes"])

@@ -1,4 +1,4 @@
-"""Structure edits with hydrogen bookkeeping, and fragment (hotkey) attachment.
+"""Structure edits with hydrogen bookkeeping, fragment hotkeys and ring fusion.
 
 Every edit takes a molecule in minimol JSON, applies one operation and returns
 
@@ -6,19 +6,31 @@ Every edit takes a molecule in minimol JSON, applies one operation and returns
 
 where ``map[old_index]`` is the atom's new index (or -1 if it was removed) and
 ``focus`` is the atom the editor should treat as the new "hotspot" (for
-example the atom just added), so key sequences can continue from it.
+example the group just added), so key sequences can continue from it.
 
-Hydrogen rules
---------------
+Edits work on 3D molecules (explicit hydrogens) and on 2D drawings
+(``dim=2``: flat, uniform bond length, implicit hydrogens, ChemDraw-style
+placement; see layout.py).
+
+Hydrogen rules (3D)
+-------------------
 * Bonding to an atom that has no free valence replaces one of its hydrogens
   (the one pointing most towards where the new bond goes).
 * With ``keep_h=True`` the hydrogens of every atom an edit touches are
-  re-derived from RDKit's valence model: new atoms come with hydrogens,
-  changing an element, a bond order or a charge fixes that atom's hydrogen
-  count, and deleting an atom caps its neighbours with hydrogens. Hydrogens on
-  untouched atoms are never moved.
-* With ``keep_h=False`` nothing is added; the structure is exactly what is
-  drawn (open valences stay open).
+  re-derived from RDKit's valence model. Hydrogens on untouched atoms are
+  never moved. With ``keep_h=False`` nothing is added.
+
+Fragment hotkeys (hover an atom, press a key; modelled on ChemDraw)
+------------------------------------------------------------------
+* "1" adds a carbon to the hovered atom ("4"/"5": a methyl towards / away from
+  the viewer, the 3D meaning of a wedge / hash).
+* Every other key turns the hovered atom into the group: "3" on a CH3 makes it
+  a phenyl ring, "o" makes it OH. On a hydrogen, that hydrogen becomes the
+  group. On an atom inside a chain or ring, single-atom groups change the
+  element and larger groups are added as a substituent.
+
+Bond hotkeys: "1"/"2"/"3" set the order, "a" fuses a benzene ring, "v" and
+"4"-"8" fuse a 3- to 8-membered ring on the open side of the bond.
 """
 
 from __future__ import annotations
@@ -29,8 +41,9 @@ from functools import lru_cache
 
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import rdDistGeom
+from rdkit.Chem import rdDepictor, rdDistGeom
 
+from . import layout
 from .chem import ChemError, _atomic_number, _integer, _relax, mol_from_json, mol_to_json
 
 _PT = Chem.GetPeriodicTable()
@@ -38,10 +51,11 @@ ORIG = "_mm_orig"
 FOCUS = "_mm_focus"
 ADJUST = "_mm_adjust"
 MAX_CHARGE = 8
+FLAT_BOND = layout.BOND_LENGTH
 
 
 # --------------------------------------------------------------------------
-# Fragment library (hover an atom, press the key)
+# Fragment library
 # --------------------------------------------------------------------------
 
 
@@ -50,25 +64,29 @@ class Fragment:
     key: str
     name: str
     smiles: str  # one "*" marks the attachment point; atom map 1 marks the focus atom
-    mode: str  # "attach": bond to the hovered atom; "replace": the hovered atom becomes this group
+    mode: str  # "attach": bond a new group to the hovered atom; "replace": the hovered atom becomes the group
+    side: str = ""  # "front" / "back": attach towards / away from the viewer
 
 
 FRAGMENTS = (
-    # Build keys: add a group to the hovered atom.
+    # Keys that add a new atom to the hovered one.
     Fragment("1", "carbon (chain)", "*C", "attach"),
-    Fragment("2", "carbonyl C=O", "*C=O", "attach"),
-    Fragment("3", "phenyl", "*c1ccccc1", "attach"),
-    Fragment("a", "phenyl", "*c1ccccc1", "attach"),
-    Fragment("6", "cyclohexyl", "*C1CCCCC1", "attach"),
-    Fragment("7", "cyclopentyl", "*C1CCCC1", "attach"),
-    Fragment("8", "vinyl", "*C=[CH2:1]", "attach"),
-    Fragment("9", "isopropyl", "*C(C)C", "attach"),
-    Fragment("z", "ethynyl", "*C#[CH:1]", "attach"),
-    Fragment("Z", "azide", "*N=[N+]=[N-]", "attach"),
-    Fragment("v", "cyclopropyl", "*C1CC1", "attach"),
-    Fragment("u", "cyclobutyl", "*C1CCC1", "attach"),
-    Fragment("K", "tert-butyl", "*C(C)(C)C", "attach"),
-    # Label keys: the hovered atom (with its hydrogens) becomes this group.
+    Fragment("4", "methyl, towards you", "*C", "attach", "front"),
+    Fragment("5", "methyl, away from you", "*C", "attach", "back"),
+    # Keys that turn the hovered atom into a group (it becomes the attachment atom).
+    Fragment("2", "C=O (carbonyl C)", "*C=O", "replace"),
+    Fragment("3", "phenyl", "*c1cc[cH:1]cc1", "replace"),
+    Fragment("a", "phenyl", "*c1cc[cH:1]cc1", "replace"),
+    Fragment("6", "cyclohexyl", "*C1CC[CH2:1]CC1", "replace"),
+    Fragment("7", "cyclopentyl", "*C1C[CH2:1]CC1", "replace"),
+    Fragment("8", "vinyl", "*C=[CH2:1]", "replace"),
+    Fragment("9", "isopropyl", "*C(C)C", "replace"),
+    Fragment("z", "ethynyl", "*C#[CH:1]", "replace"),
+    Fragment("Z", "azide", "*N=[N+]=[N-]", "replace"),
+    Fragment("v", "cyclopropyl", "*C1C[CH2:1]1", "replace"),
+    Fragment("u", "cyclobutyl", "*C1C[CH2:1]C1", "replace"),
+    Fragment("k", "SO2", "*S(=O)=O", "replace"),
+    Fragment("K", "tert-butyl", "*C(C)(C)C", "replace"),
     Fragment("o", "OH", "*O", "replace"),
     Fragment("q", "OH", "*O", "replace"),
     Fragment("O", "OMe", "*OC", "replace"),
@@ -78,7 +96,7 @@ FRAGMENTS = (
     Fragment("s", "SH", "*S", "replace"),
     Fragment("S", "SiH3", "*[SiH3]", "replace"),
     Fragment("p", "PH2", "*P", "replace"),
-    Fragment("P", "Ph", "*c1ccccc1", "replace"),
+    Fragment("P", "Ph", "*c1cc[cH:1]cc1", "replace"),
     Fragment("f", "F", "*F", "replace"),
     Fragment("F", "CF3", "*C(F)(F)F", "replace"),
     Fragment("l", "Cl", "*Cl", "replace"),
@@ -100,6 +118,25 @@ FRAGMENTS = (
 )
 FRAGMENT_BY_KEY = {f.key: f for f in FRAGMENTS}
 
+# Bond hotkeys: key -> ("order", n) or ("fuse", ring size, aromatic)
+BOND_KEYS = {
+    "1": ("order", 1),
+    "2": ("order", 2),
+    "3": ("order", 3),
+    "a": ("fuse", 6, True),
+    "v": ("fuse", 3, False),
+    "4": ("fuse", 4, False),
+    "5": ("fuse", 5, False),
+    "6": ("fuse", 6, False),
+    "7": ("fuse", 7, False),
+    "8": ("fuse", 8, False),
+}
+BOND_KEY_NAMES = {
+    "1": "single", "2": "double", "3": "triple", "a": "fuse benzene", "v": "fuse cyclopropane",
+    "4": "fuse cyclobutane", "5": "fuse cyclopentane", "6": "fuse cyclohexane",
+    "7": "fuse cycloheptane", "8": "fuse cyclooctane",
+}
+
 
 @dataclass(frozen=True)
 class Template:
@@ -116,9 +153,12 @@ class Template:
         return sum(1 for i, e in enumerate(self.elements) if e != "H" and i != self.dummy)
 
 
+_ORDER_OF = {Chem.BondType.SINGLE: 1, Chem.BondType.DOUBLE: 2, Chem.BondType.TRIPLE: 3}
+
+
 @lru_cache(maxsize=None)
-def template(key: str) -> Template:
-    """3D geometry of a fragment, with an H in place of the attachment point."""
+def template(key: str, flat: bool = False) -> Template:
+    """Geometry of a fragment, with an H (3D) or a dummy (2D) in place of the attachment point."""
     frag = FRAGMENT_BY_KEY[key]
     mol = Chem.MolFromSmiles(frag.smiles, sanitize=False)
     dummies = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 0]
@@ -138,21 +178,25 @@ def template(key: str) -> Template:
     rw.GetAtomWithIdx(dummy).SetAtomicNum(1)  # a hydrogen stands in for the parent
     m = rw.GetMol()
     Chem.SanitizeMol(m)
-    m = Chem.AddHs(m)
-    params = rdDistGeom.ETKDGv3()
-    params.randomSeed = 0x5EED
-    if rdDistGeom.EmbedMolecule(m, params) != 0:
-        raise ValueError(f"could not embed fragment {key!r}")
-    _relax(m)
+    if flat:
+        rdDepictor.Compute2DCoords(m)  # bonds of length 1.5, like layout.BOND_LENGTH
+    else:
+        m = Chem.AddHs(m)
+        params = rdDistGeom.ETKDGv3()
+        params.randomSeed = 0x5EED
+        if rdDistGeom.EmbedMolecule(m, params) != 0:
+            raise ValueError(f"could not embed fragment {key!r}")
+        _relax(m)
     Chem.Kekulize(m, clearAromaticFlags=True)
     conf = m.GetConformer()
     coords = np.array([list(conf.GetAtomPosition(i)) for i in range(m.GetNumAtoms())])
-    order = {Chem.BondType.SINGLE: 1, Chem.BondType.DOUBLE: 2, Chem.BondType.TRIPLE: 3}
+    if flat:
+        coords[:, 2] = 0.0
     return Template(
         elements=tuple(a.GetSymbol() for a in m.GetAtoms()),
         charges=tuple(a.GetFormalCharge() for a in m.GetAtoms()),
         coords=coords,
-        bonds=tuple((b.GetBeginAtomIdx(), b.GetEndAtomIdx(), order[b.GetBondType()]) for b in m.GetBonds()),
+        bonds=tuple((b.GetBeginAtomIdx(), b.GetEndAtomIdx(), _ORDER_OF[b.GetBondType()]) for b in m.GetBonds()),
         dummy=dummy,
         attach=attach,
         focus=focus,
@@ -161,6 +205,16 @@ def template(key: str) -> Template:
 
 def fragment_list() -> list[dict]:
     return [{"key": f.key, "name": f.name, "mode": f.mode} for f in FRAGMENTS]
+
+
+def bond_key_list() -> list[dict]:
+    out = []
+    for key, spec in BOND_KEYS.items():
+        if spec[0] == "order":
+            out.append({"key": key, "name": BOND_KEY_NAMES[key], "op": "order", "order": spec[1]})
+        else:
+            out.append({"key": key, "name": BOND_KEY_NAMES[key], "op": "fuse", "size": spec[1], "aromatic": spec[2]})
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -179,9 +233,11 @@ def _align(u: np.ndarray, v: np.ndarray) -> np.ndarray:
     if c > 1 - 1e-12:
         return np.eye(3)
     if c < -1 + 1e-12:
+        # Half turn; for vectors in the xy-plane turn about z so they stay in it.
+        if abs(u[2]) < 1e-9 and abs(v[2]) < 1e-9:
+            return _axis_rotation(np.array([0, 0, 1.0]), math.pi)
         other = np.array([1.0, 0, 0]) if abs(u[0]) < 0.9 else np.array([0, 1.0, 0])
-        k = _unit(np.cross(u, other))
-        return _axis_rotation(k, math.pi)
+        return _axis_rotation(_unit(np.cross(u, other)), math.pi)
     k = np.cross(u, v)
     s = float(np.linalg.norm(k))
     k = k / s
@@ -203,6 +259,11 @@ def _perpendicular(u: np.ndarray, hint: np.ndarray) -> np.ndarray:
     return p
 
 
+def _rot2d(v: np.ndarray, degrees: float) -> np.ndarray:
+    t = math.radians(degrees)
+    return np.array([v[0] * math.cos(t) - v[1] * math.sin(t), v[0] * math.sin(t) + v[1] * math.cos(t), 0.0])
+
+
 # --------------------------------------------------------------------------
 # Editing session on an RDKit molecule
 # --------------------------------------------------------------------------
@@ -215,6 +276,9 @@ class View:
     to_camera: np.ndarray
 
 
+FLAT_VIEW = View(np.array([1.0, 0, 0]), np.array([0, 1.0, 0]), np.array([0, 0, 1.0]))
+
+
 def _vector(value: object, what: str) -> np.ndarray:
     if not isinstance(value, (list, tuple)) or len(value) != 3:
         raise ChemError(f"{what} must be a list of three numbers")
@@ -225,7 +289,7 @@ def _vector(value: object, what: str) -> np.ndarray:
 
 def _view(value: object) -> View:
     if value is None:
-        return View(np.array([1.0, 0, 0]), np.array([0, 1.0, 0]), np.array([0, 0, 1.0]))
+        return FLAT_VIEW
     if not isinstance(value, dict):
         raise ChemError("view must be an object")
     right = _unit(_vector(value.get("right"), "view.right"))
@@ -239,13 +303,14 @@ def _view(value: object) -> View:
 class Session:
     """Mutable working copy used while applying one edit."""
 
-    def __init__(self, data: object, keep_h: bool, view: View):
+    def __init__(self, data: object, keep_h: bool, view: View, flat: bool = False):
         self.mol = mol_from_json(data, sanitize=False)
         for a in self.mol.GetAtoms():
             a.SetIntProp(ORIG, a.GetIdx())
         self.n_orig = self.mol.GetNumAtoms()
-        self.keep_h = keep_h
-        self.view = view
+        self.flat = flat
+        self.keep_h = keep_h and not flat  # 2D drawings keep hydrogens implicit
+        self.view = FLAT_VIEW if flat else view
         self.notes: list[str] = []
         self.doomed: set[int] = set()  # atoms to remove at the end (current indices, nothing removed yet)
 
@@ -289,7 +354,15 @@ class Session:
         return probe.GetAtomWithIdx(j).GetNumImplicitHs()
 
     def bond_length(self, a: str, b: str) -> float:
-        return _PT.GetRcovalent(a) + _PT.GetRcovalent(b)
+        return FLAT_BOND if self.flat else _PT.GetRcovalent(a) + _PT.GetRcovalent(b)
+
+    def clash(self, p: np.ndarray, ignore: set[int]) -> float:
+        """Distance from p to the closest atom not in ``ignore``."""
+        best = math.inf
+        for j in range(self.mol.GetNumAtoms()):
+            if j not in self.doomed and j not in ignore:
+                best = min(best, float(np.linalg.norm(self.pos(j) - p)))
+        return best
 
     def default_hint(self, i: int) -> np.ndarray:
         """Away from the heavy neighbours, within the screen plane."""
@@ -304,6 +377,8 @@ class Session:
 
     def auto_direction(self, i: int, hint: np.ndarray | None) -> np.ndarray:
         """Direction for a new bond on atom i when no hydrogen is replaced."""
+        if self.flat:
+            return self.flat_direction(i, hint)
         p = self.pos(i)
         dirs = [u for u in (_unit(self.pos(j) - p) for j in self.neighbors(i)) if u is not None]
         if hint is not None:
@@ -322,6 +397,39 @@ class Session:
         n = _unit(n) if np.linalg.norm(n) > 0.1 else _perpendicular(dirs[0], self.view.up)
         return -n if float(np.dot(n, self.view.to_camera)) < 0 else n
 
+    def flat_direction(self, i: int, hint: np.ndarray | None) -> np.ndarray:
+        """ChemDraw-like placement in 2D: 30 degrees for a first bond, 120 degree zigzag, largest gap."""
+        if hint is not None:
+            h = _unit(np.array([hint[0], hint[1], 0.0]))
+            if h is not None:
+                return h
+        p = self.pos(i)
+        nbs = [j for j in self.neighbors(i) if _unit(self.pos(j) - p) is not None]
+        if not nbs:
+            return _rot2d(np.array([1.0, 0, 0]), 30)
+        dirs = [_unit(self.pos(j) - p) for j in nbs]
+        if len(dirs) == 1:
+            u = dirs[0]
+            candidates = [_rot2d(u, 120), _rot2d(u, -120)]
+            parent = nbs[0]
+            grand = [k for k in self.neighbors(parent) if k != i]
+            if grand:
+                # Zigzag: the new bond runs parallel to the bond grandparent -> parent.
+                want = _unit(self.pos(parent) - self.pos(grand[0]))
+                score = [float(np.dot(c, want)) for c in candidates]
+            else:
+                score = [-abs(c[1]) for c in candidates]  # prefer the more horizontal one
+            order = sorted(range(2), key=lambda k: -score[k])
+            for k in order:
+                if self.clash(p + candidates[k] * FLAT_BOND, {i}) > 0.6 * FLAT_BOND:
+                    return candidates[k]
+            return candidates[order[0]]
+        angles = sorted(math.atan2(d[1], d[0]) for d in dirs)
+        gaps = [(angles[(k + 1) % len(angles)] - angles[k]) % (2 * math.pi) or 2 * math.pi for k in range(len(angles))]
+        k = max(range(len(gaps)), key=lambda x: gaps[x])
+        mid = angles[k] + gaps[k] / 2
+        return np.array([math.cos(mid), math.sin(mid), 0.0])
+
     def slot_for_new_bond(self, i: int, hint: np.ndarray | None) -> np.ndarray:
         """Direction for a new bond on atom i, replacing a hydrogen if i has no free valence.
 
@@ -336,9 +444,9 @@ class Session:
             p = self.pos(i)
             best = max(hs, key=lambda h: float(np.dot(_unit(self.pos(h) - p), aim)))
             self.doomed.add(best)
-            return hint if hint is not None else _unit(self.pos(best) - p)
-        if not hs and self.open_valence(i) == 0 and self.heavy_neighbors(i):
-            self.notes.append(f"{self.el(i)}{i + 1} had no free valence; it now has an extra bond.")
+            if hint is not None:
+                return self.auto_direction(i, hint)
+            return _unit(self.pos(best) - p)
         return self.auto_direction(i, hint)
 
     # ----------------------------------------------------------------- edits
@@ -348,14 +456,20 @@ class Session:
         a.SetFormalCharge(charge)
         a.SetNoImplicit(True)
         i = self.mol.AddAtom(a)
+        if self.flat:
+            p = np.array([p[0], p[1], 0.0])
         self.mol.GetConformer().SetAtomPosition(i, p.tolist())
         return i
 
-    def set_focus(self, i: int) -> None:
+    def add_bond(self, a: int, b: int, order: int = 1) -> None:
+        self.mol.AddBond(a, b, _ORDER[order])
+
+    def set_focus(self, i: int | None) -> None:
         for a in self.mol.GetAtoms():
             if a.HasProp(FOCUS):
                 a.ClearProp(FOCUS)
-        self.mol.GetAtomWithIdx(i).SetIntProp(FOCUS, 1)
+        if i is not None:
+            self.mol.GetAtomWithIdx(i).SetIntProp(FOCUS, 1)
 
     def mark_adjust(self, i: int) -> None:
         if self.keep_h and i not in self.doomed:
@@ -369,7 +483,8 @@ class Session:
     def place_template(self, tpl: Template, parent: int | None, base: np.ndarray, d: np.ndarray) -> int:
         """Add a fragment whose attach atom sits at ``base`` with its open bond pointing back along -d.
 
-        Returns the index of the fragment's focus atom.
+        The fragment is turned about the new bond (3D) or mirrored (2D) to keep
+        clear of existing atoms. Returns the index of the fragment's focus atom.
         """
         A = tpl.coords[tpl.attach]
         u = _unit(tpl.coords[tpl.dummy] - A)
@@ -380,31 +495,32 @@ class Session:
             for k, e in enumerate(tpl.elements)
             if k != tpl.dummy and (self.keep_h or e != "H" or k == tpl.attach)
         ]
-        others = [
-            self.pos(j)
-            for j in range(self.mol.GetNumAtoms())
-            if j not in self.doomed and j != parent
-        ]
-        best_angle, best_score = 0.0, None
+        others = [self.pos(j) for j in range(self.mol.GetNumAtoms()) if j not in self.doomed and j != parent]
+        if self.flat:
+            # The two orientations in the plane: as is, or mirrored across the bond axis.
+            mirror = 2 * np.outer(d, d) - np.eye(3)
+            options = [np.eye(3), mirror]
+        else:
+            options = [_axis_rotation(d, step * math.pi / 12) for step in range(24)]
+        best, best_score = options[0], None
         if others and len(keep) > 1:
             existing = np.array(others)
-            for step in range(24):
-                angle = step * math.pi / 12
-                pts = local[keep] @ _axis_rotation(d, angle).T + base
+            for option in options:
+                pts = local[keep] @ option.T + base
                 diff = pts[:, None, :] - existing[None, :, :]
                 r2 = np.maximum(np.einsum("ijk,ijk->ij", diff, diff), 0.25)
                 score = float(np.sum(1.0 / r2**3))
                 if best_score is None or score < best_score - 1e-12:
-                    best_angle, best_score = angle, score
-        final = local @ _axis_rotation(d, best_angle).T + base
+                    best, best_score = option, score
+        final = local @ best.T + base
         index = {}
         for k in keep:
             index[k] = self.add_atom(tpl.elements[k], final[k], tpl.charges[k])
         for a, b, order in tpl.bonds:
             if a in index and b in index:
-                self.mol.AddBond(index[a], index[b], {1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE, 3: Chem.BondType.TRIPLE}[order])
+                self.add_bond(index[a], index[b], order)
         if parent is not None:
-            self.mol.AddBond(parent, index[tpl.attach], Chem.BondType.SINGLE)
+            self.add_bond(parent, index[tpl.attach])
         elif self.keep_h:
             # No parent: the open attachment point gets a hydrogen.
             self.mol.GetAtomWithIdx(index[tpl.attach]).SetIntProp(ADJUST, 1)
@@ -424,7 +540,29 @@ class Session:
                 mapping[a.GetIntProp(ORIG)] = a.GetIdx()
             if a.HasProp(FOCUS):
                 focus = a.GetIdx()
-        return {"molecule": mol_to_json(mol, self.notes), "map": mapping, "focus": focus, "notes": self.notes}
+        if self.flat:
+            molecule = layout.to_json_2d(mol, self.notes)  # flags such atoms as "bad" for the drawing
+        else:
+            self.notes.extend(_valence_notes(mol))
+            molecule = mol_to_json(mol, self.notes)
+        return {"molecule": molecule, "map": mapping, "focus": focus, "notes": self.notes}
+
+
+def _valence_notes(mol: Chem.Mol) -> list[str]:
+    """Warnings for atoms with more bonds than any allowed valence (3D: hydrogens are explicit)."""
+    probe = Chem.RWMol(mol)
+    for a in probe.GetAtoms():
+        a.SetNoImplicit(True)
+    probe.UpdatePropertyCache(strict=False)
+    bad = sorted(
+        p.GetAtomIdx()
+        for p in Chem.DetectChemistryProblems(probe)
+        if p.GetType() == "AtomValenceException"
+    )
+    if not bad:
+        return []
+    names = ", ".join(f"{probe.GetAtomWithIdx(i).GetSymbol()}{i + 1}" for i in bad[:6]) + (", ..." if len(bad) > 6 else "")
+    return [f"Too many bonds on {names}; fix this before optimizing."]
 
 
 def _adjust_hydrogens(mol: Chem.RWMol) -> Chem.RWMol:
@@ -523,13 +661,15 @@ def _cap_isolated(mol: Chem.RWMol, i: int, count: int) -> None:
 _ORDER = {1: Chem.BondType.SINGLE, 2: Chem.BondType.DOUBLE, 3: Chem.BondType.TRIPLE}
 
 
-def apply_edit(data: object, op: object, keep_h: object = True, view: object = None) -> dict:
+def apply_edit(data: object, op: object, keep_h: object = True, view: object = None, dim: object = 3) -> dict:
     """Apply one editing operation. See the module docstring for the result."""
     if not isinstance(op, dict):
         raise ChemError("op must be an object")
     if not isinstance(keep_h, bool):
         raise ChemError("keep_h must be true or false")
-    s = Session(data, keep_h, _view(view))
+    if dim not in (2, 3):
+        raise ChemError("dim must be 2 or 3")
+    s = Session(data, keep_h, _view(view), flat=dim == 2)
     kind = op.get("type")
     hint = _unit(_vector(op["hint"], "hint")) if op.get("hint") is not None else None
 
@@ -548,7 +688,7 @@ def apply_edit(data: object, op: object, keep_h: object = True, view: object = N
             raise ChemError("A hydrogen already has its bond. Click the H with another element to replace it.")
         d = s.slot_for_new_bond(i, hint)
         j = s.add_atom(el, s.pos(i) + d * s.bond_length(s.el(i), el))
-        s.mol.AddBond(i, j, Chem.BondType.SINGLE)
+        s.add_bond(i, j)
         s.mark_adjust(j)
         s.set_focus(j)
 
@@ -563,7 +703,7 @@ def apply_edit(data: object, op: object, keep_h: object = True, view: object = N
             if s.is_h(x) and s.neighbors(x):
                 raise ChemError("A hydrogen already has its bond")
             s.slot_for_new_bond(x, _unit(s.pos(y) - s.pos(x)))
-        s.mol.AddBond(a, b, Chem.BondType.SINGLE)
+        s.add_bond(a, b)
         s.set_focus(b)
 
     elif kind == "element":
@@ -590,6 +730,9 @@ def apply_edit(data: object, op: object, keep_h: object = True, view: object = N
         bond.SetBondType(_ORDER[order])
         s.mark_adjust(a)
         s.mark_adjust(b)
+
+    elif kind == "fuse":
+        _fuse(s, op, hint)
 
     elif kind == "charge":
         atoms = op.get("atoms")
@@ -627,45 +770,45 @@ def apply_edit(data: object, op: object, keep_h: object = True, view: object = N
                     s.mark_adjust(j)
 
     elif kind == "fragment":
-        _fragment(s, op)
+        _fragment(s, op, hint)
 
     else:
         raise ChemError(f"Unknown edit {kind!r}")
     return s.finish()
 
 
-def _fragment(s: Session, op: dict) -> None:
+def _fragment(s: Session, op: dict, hint: np.ndarray | None) -> None:
     key = op.get("key")
     frag = FRAGMENT_BY_KEY.get(key) if isinstance(key, str) else None
     if frag is None:
         raise ChemError(f"No fragment for key {key!r}")
-    tpl = template(key)
+    tpl = template(key, s.flat)
     t = s.check_atom(op.get("atom"))
-    hint = _unit(_vector(op["hint"], "hint")) if op.get("hint") is not None else None
     attach_el = tpl.elements[tpl.attach]
-    view = s.view
 
     def place_on(parent: int, d: np.ndarray) -> None:
         base = s.pos(parent) + d * s.bond_length(s.el(parent), attach_el)
         s.set_focus(s.place_template(tpl, parent, base, d))
 
+    def attach_to(parent: int) -> None:
+        aim = hint
+        if frag.side and not s.flat:
+            aim = s.view.to_camera if frag.side == "front" else -s.view.to_camera
+        place_on(parent, s.slot_for_new_bond(parent, aim))
+
     if s.is_h(t):
         nb = s.neighbors(t)
-        if len(nb) == 1:
-            parent = nb[0]
-            d = _unit(s.pos(t) - s.pos(parent))
-            s.doomed.add(t)
-            place_on(parent, d)
-            return
-        if nb:
+        if len(nb) > 1:
             raise ChemError("This hydrogen has more than one bond")
         s.doomed.add(t)
-        s.set_focus(s.place_template(tpl, None, s.pos(t), view.up))
+        if nb:
+            place_on(nb[0], _unit(s.pos(t) - s.pos(nb[0])))
+        else:
+            s.set_focus(s.place_template(tpl, None, s.pos(t), s.view.up))
         return
 
     if frag.mode == "attach":
-        d = s.slot_for_new_bond(t, hint)
-        place_on(t, d)
+        attach_to(t)
         return
 
     heavy = s.heavy_neighbors(t)
@@ -677,11 +820,15 @@ def _fragment(s: Session, op: dict) -> None:
     elif not heavy:
         p = s.pos(t)
         s.doom_with_hydrogens(t)
-        s.set_focus(s.place_template(tpl, None, p, view.up))
+        s.set_focus(s.place_template(tpl, None, p, s.view.up))
     elif tpl.heavy_count == 1:
         # An atom inside a chain or ring: change its element instead.
         z = _atomic_number(attach_el)
-        valence = sum(b.GetBondTypeAsDouble() for b in s.mol.GetAtomWithIdx(t).GetBonds() if b.GetOtherAtomIdx(t) not in s.doomed and not s.is_h(b.GetOtherAtomIdx(t)))
+        valence = sum(
+            b.GetBondTypeAsDouble()
+            for b in s.mol.GetAtomWithIdx(t).GetBonds()
+            if b.GetOtherAtomIdx(t) not in s.doomed and not s.is_h(b.GetOtherAtomIdx(t))
+        )
         allowed = max(_PT.GetValenceList(z))
         if allowed != -1 and valence > allowed:
             raise ChemError(f"{attach_el} cannot replace {s.el(t)}{t + 1}: it has {valence:g} bonds to heavy atoms")
@@ -689,4 +836,94 @@ def _fragment(s: Session, op: dict) -> None:
         s.mark_adjust(t)
         s.set_focus(t)
     else:
-        raise ChemError(f"{frag.name} replaces end atoms only; hover a terminal atom or a hydrogen")
+        # Inside a chain or ring a larger group cannot take the atom's place; add it as a substituent.
+        attach_to(t)
+        s.notes.append(f"{frag.name} was added to {s.el(t)}{t + 1} as a substituent (the atom is inside a chain or ring).")
+
+
+def _fuse(s: Session, op: dict, hint: np.ndarray | None) -> None:
+    """Fuse a ring onto the bond a-b, on its open side."""
+    a = s.check_atom(op.get("a"))
+    b = s.check_atom(op.get("b"))
+    size = _integer(op.get("size"), "size")
+    aromatic = op.get("aromatic", False)
+    if not 3 <= size <= 8:
+        raise ChemError("Ring size must be between 3 and 8")
+    if not isinstance(aromatic, bool) or (aromatic and size != 6):
+        raise ChemError("Only six-membered rings can be fused as benzene")
+    bond = s.mol.GetBondBetweenAtoms(a, b)
+    if bond is None:
+        raise ChemError("These atoms are not bonded")
+    if s.is_h(a) or s.is_h(b):
+        raise ChemError("Rings can only be fused onto a bond between two heavy atoms")
+    order_ab = _ORDER_OF.get(bond.GetBondType(), 1)
+    if order_ab == 3:
+        raise ChemError("A ring cannot be fused onto a triple bond")
+
+    pa, pb = s.pos(a), s.pos(b)
+    length = float(np.linalg.norm(pb - pa))
+    u = _unit(pb - pa)
+    if u is None:
+        raise ChemError("The two atoms are on top of each other")
+    mid = (pa + pb) / 2
+    apothem = length / (2 * math.tan(math.pi / size))
+    radius = length / (2 * math.sin(math.pi / size))
+    start = math.atan2(-apothem, length / 2)  # angle of b seen from the centre, in the (u, side) basis
+
+    def ring_points(side: np.ndarray) -> list[np.ndarray]:
+        center = mid + side * apothem
+        normal = np.cross(u, side)
+        pts = []
+        for k in range(1, size - 1):
+            t = start + k * 2 * math.pi / size
+            p = center + radius * (math.cos(t) * u + math.sin(t) * side)
+            if not s.flat and not aromatic and size >= 5:
+                p = p + normal * (0.25 if k % 2 else -0.25)  # pucker so optimization does not sit on a flat ring
+            pts.append(p)
+        return pts
+
+    # Candidate sides: both directions in the plane (2D), or turns about the bond (3D).
+    base = _perpendicular(u, s.view.up if not s.flat else np.array([-u[1], u[0], 0.0]))
+    if s.flat:
+        sides = [base, -base]
+    else:
+        sides = [_axis_rotation(u, k * math.pi / 12) @ base for k in range(24)]
+    # Hydrogens on a and b are re-derived (3D) and do not count as obstacles.
+    ignore = {a, b} | (set(s.h_neighbors(a)) | set(s.h_neighbors(b)) if s.keep_h else set())
+    others = [s.pos(j) for j in range(s.mol.GetNumAtoms()) if j not in ignore and j not in s.doomed]
+    crowd = np.zeros(3)
+    for x in (a, b):
+        for k in s.heavy_neighbors(x):
+            if k not in (a, b):
+                v = s.pos(k) - mid
+                w = _unit(v - u * float(np.dot(v, u)))
+                if w is not None:
+                    crowd += w
+
+    def score(side: np.ndarray) -> tuple[float, float]:
+        clearance = min((float(np.linalg.norm(p - q)) for p in ring_points(side) for q in others), default=math.inf)
+        # Round clearance so near-ties fall back to "away from the neighbours" (then the hint).
+        away = -float(np.dot(side, crowd))
+        if hint is not None:
+            away += 0.01 * float(np.dot(side, hint))
+        return (round(min(clearance, 3.0), 1), away)
+
+    side = max(sides, key=score)
+    new = [s.add_atom("C", p) for p in ring_points(side)]
+
+    ring = [b, *new, a]  # path from b round to a
+    if aromatic:
+        others_double = any(
+            _ORDER_OF.get(bd.GetBondType()) == 2 and bd.GetOtherAtomIdx(x) not in (a, b)
+            for x in (a, b)
+            for bd in s.mol.GetAtomWithIdx(x).GetBonds()
+        )
+        first = 1 if (order_ab == 2 or others_double) else 2
+        orders = [first if k % 2 == 0 else 3 - first for k in range(size - 1)]
+    else:
+        orders = [1] * (size - 1)
+    for k in range(size - 1):
+        s.add_bond(ring[k], ring[k + 1], orders[k])
+    for x in (a, b, *new):
+        s.mark_adjust(x)
+    s.set_focus(None)

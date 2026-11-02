@@ -1,8 +1,10 @@
 // minimol editor: wires the toolbar, mouse tools and keyboard to the model,
-// the viewer and the server.
+// the viewers and the server.
 //
 // Rules that keep the editor predictable:
 //  * history.current is the only molecule; every change goes through commit().
+//    A 2D drawing is a model with `dim: 2`; whether the editor is in 2D or 3D
+//    follows from the current model, so undo/redo also crosses mode switches.
 //  * Structural edits are done by the server (RDKit knows valences), one at a
 //    time. While a server call runs (state.busy) nothing may change the
 //    molecule, so a result always applies to the structure it was made for.
@@ -14,9 +16,11 @@ import { bondLength, normalizeSymbol } from "./elements.js";
 import { History } from "./history.js";
 import * as M from "./model.js";
 import { Viewer } from "./viewer.js";
+import { Viewer2D } from "./viewer2d.js";
 
 const $ = (id) => document.getElementById(id);
 const CLICK_SLOP = 4; // pixels a pointer may move and still count as a click
+const FLAT_BOND = 1.5; // bond length of 2D drawings (layout.BOND_LENGTH on the server)
 const QUICK_ELEMENTS = ["H", "C", "N", "O", "F", "P", "S", "Cl", "Br", "I"];
 const KEY_ELEMENTS = { h: "H", c: "C", n: "N", o: "O", f: "F", p: "P", s: "S" };
 
@@ -33,6 +37,8 @@ const state = {
   keepH: loadSetting("keepH", true),
   hotkeys: loadSetting("hotkeys", true),
   fragments: new Map(), // key -> {name, mode}
+  bondKeys: new Map(), // key -> {op, order | size, aromatic}
+  lastSwitch: null, // { from, to }: switching back from `to` restores `from` exactly
 };
 
 function loadSetting(name, fallback) {
@@ -55,9 +61,9 @@ function saveSetting(name, value) {
 const history = new History(M.emptyModel());
 state.saved = history.current;
 
-let viewer;
+const viewers = {};
 try {
-  viewer = new Viewer($("viewport"));
+  viewers[3] = new Viewer($("viewport"));
 } catch (err) {
   window.minimolWebGLFailed = true;
   $("hint").textContent =
@@ -65,10 +71,20 @@ try {
     "In the desktop app, try starting it with: minimol --software-gl";
   throw err;
 }
-viewer.setModel(history.current);
-viewer.fit(history.current);
+viewers[2] = new Viewer2D($("viewport"));
+let viewer = viewers[3];
+viewers[2].canvas.hidden = true;
+for (const v of Object.values(viewers)) {
+  v.canvas.tabIndex = -1; // focusable, so clicking the view takes keyboard focus from inputs
+  v.setModel(history.current);
+  v.fit(history.current);
+}
 
 const model = () => history.current;
+const dimOf = (m) => (m.dim === 2 ? 2 : 3);
+const dim = () => dimOf(model());
+/** Tag a server molecule with the editor's dimension. */
+const withDim = (m, d) => (d === 2 ? { ...m, dim: 2 } : m);
 
 // ------------------------------------------------------------ messages
 
@@ -106,12 +122,23 @@ function commit(next, { view = null } = {}) {
   return true;
 }
 
+function activateViewer() {
+  const v = viewers[dim()];
+  if (v === viewer) return false;
+  viewer.setHover(null);
+  viewer.canvas.hidden = true;
+  viewer = v;
+  viewer.canvas.hidden = false;
+  return true;
+}
+
 function refreshModel(view = null) {
   const m = model();
+  const switched = activateViewer();
   state.selection = state.selection.filter((i) => i < m.atoms.length);
   viewer.setModel(m);
   viewer.setSelection(state.selection);
-  if (view === "reset") viewer.fit(m, false);
+  if (view === "reset" || switched) viewer.fit(m, false);
   else if (view === "fit") viewer.fit(m, true);
   setTarget(state.pointer && !drag ? viewer.pick(state.pointer.x, state.pointer.y) : null);
   updateUI();
@@ -177,14 +204,22 @@ async function busyCall(text, fn, { quiet = false } = {}) {
 async function serverEdit(op) {
   if (!canEdit()) return null;
   const m = model();
-  const body = { molecule: m, op, keep_h: state.keepH, view: viewer.viewAxes() };
+  const d = dimOf(m);
+  const body = { molecule: m, op, keep_h: state.keepH, view: viewer.viewAxes(), dim: d };
   const r = await busyCall("Editing…", () => api("/api/edit", body), { quiet: true });
   if (!r || model() !== m) return null;
   state.selection = state.selection.map((i) => r.map[i]).filter((i) => i >= 0);
-  if (!commit(r.molecule)) return null;
+  if (!commit(withDim(r.molecule, d))) return null;
   if (r.notes.length) setMessage(r.notes.join(" "), "warn");
   else setMessage("");
   return r;
+}
+
+/** Add a molecule from the server next to what is there (or as the whole scene). */
+function insertMolecule(molecule, d) {
+  const m = model();
+  if (m.atoms.length === 0) return commit(withDim(molecule, d), { view: "reset" });
+  return commit(withDim(M.append(m, molecule, M.besideOffset(m, molecule)).model, d), { view: "fit" });
 }
 
 async function openFile(file) {
@@ -194,16 +229,19 @@ async function openFile(file) {
     return;
   }
   const text = await file.text();
-  const r = await busyCall(`Opening ${file.name}…`, () => api("/api/import", { name: file.name, text }));
+  const d = dim();
+  const r = await busyCall(`Opening ${file.name}…`, () => api("/api/import", { name: file.name, text, dim: d }));
   if (!r) return;
   state.selection = [];
-  if (commit(r.molecule, { view: "reset" })) {
+  if (commit(withDim(r.molecule, d), { view: "reset" })) {
     state.fileName = file.name.replace(/\.[^.]*$/, "") || "molecule";
     state.saved = model();
     updateUI();
     showNotes(r.notes, `Opened ${file.name}.`);
   }
 }
+
+let pendingSave = null;
 
 async function save() {
   const m = model();
@@ -212,7 +250,9 @@ async function save() {
     return;
   }
   const fmt = $("save-format").value;
-  const r = await busyCall("Saving…", () => api("/api/export", { molecule: m, format: fmt, title: state.fileName }));
+  const r = await busyCall("Saving…", () =>
+    api("/api/export", { molecule: m, format: fmt, title: state.fileName, dim: dimOf(m) }),
+  );
   if (!r) return;
   const url = URL.createObjectURL(new Blob([r.text], { type: "text/plain" }));
   const a = document.createElement("a");
@@ -233,8 +273,6 @@ async function save() {
   setMessage(`Saved ${a.download}.`);
 }
 
-let pendingSave = null;
-
 // Called by the desktop window after its save dialog.
 window.minimolSaved = (path) => {
   if (pendingSave) state.saved = pendingSave;
@@ -252,20 +290,17 @@ window.minimolSaveFailed = (reason) => {
 async function insertSmiles(smiles) {
   smiles = smiles.trim();
   if (!smiles || !canEdit()) return;
-  const r = await busyCall("Building 3D structure…", () => api("/api/smiles", { smiles }));
+  const d = dim();
+  const r = await busyCall("Building structure…", () => api("/api/smiles", { smiles, dim: d }));
   if (!r) return;
-  const m = model();
-  if (m.atoms.length === 0) {
-    commit(r.molecule, { view: "reset" });
-  } else {
-    commit(M.append(m, r.molecule, M.besideOffset(m, r.molecule)).model, { view: "fit" });
-  }
+  insertMolecule(r.molecule, d);
   $("smiles").value = "";
+  $("smiles").blur(); // hand the keyboard back to the view
   showNotes(r.notes, `Inserted ${smiles}.`);
 }
 
 async function addHydrogens() {
-  if (!canEdit()) return;
+  if (!canEdit() || dim() === 2) return;
   const m = model();
   if (m.atoms.length === 0) return;
   const r = await busyCall("Adding hydrogens…", () => api("/api/addh", { molecule: m }));
@@ -279,6 +314,11 @@ async function optimize() {
   const m = model();
   if (m.atoms.length === 0) {
     setMessage("Nothing to optimize yet.", "warn");
+    return;
+  }
+  if (dimOf(m) === 2) {
+    const r = await busyCall("Cleaning up…", () => api("/api/clean2d", { molecule: m }));
+    if (r && model() === m && commit(withDim(r.molecule, 2))) setMessage("Cleaned up the drawing.");
     return;
   }
   const method = $("method").value;
@@ -317,6 +357,74 @@ async function optimize() {
   showNotes(r.notes, `Optimized with ${r.method} in ${secs} s${r.converged ? "" : " (not converged)"}.`);
 }
 
+/** Switch between the 3D editor and the 2D drawing. */
+async function switchMode(target) {
+  if (!canEdit() || target === dim()) return;
+  const m = model();
+  // Switching straight back without editing restores the exact structure.
+  if (state.lastSwitch && state.lastSwitch.to === m && dimOf(state.lastSwitch.from) === target) {
+    const from = state.lastSwitch.from;
+    state.lastSwitch = { from: m, to: from };
+    state.selection = [];
+    commit(from, { view: "reset" });
+    setMessage(target === 2 ? "Back to the 2D drawing." : "Back to the 3D structure.");
+    return;
+  }
+  if (m.atoms.length === 0) {
+    commit(withDim(M.emptyModel(), target), { view: "reset" });
+    return;
+  }
+  const r = await busyCall(target === 2 ? "Drawing in 2D…" : "Building 3D structure…", () =>
+    api("/api/convert", { molecule: m, to: target }),
+  );
+  if (!r || model() !== m) return;
+  const next = withDim(r.molecule, target);
+  state.selection = [];
+  if (commit(next, { view: "reset" })) {
+    state.lastSwitch = { from: m, to: next };
+    showNotes(r.notes, target === 2 ? "2D drawing: hydrogens are implicit." : "Built a 3D structure (ETKDG + force field).");
+  }
+}
+
+// ------------------------------------------------------------ clipboard
+
+async function copySelection({ cut = false } = {}) {
+  const m = model();
+  if (m.atoms.length === 0) {
+    setMessage("Nothing to copy.", "warn");
+    return;
+  }
+  const atoms = state.selection.length ? state.selection : null;
+  let r;
+  try {
+    r = await api("/api/copy", { molecule: m, atoms, dim: dimOf(m) });
+    if (r.target === "text") await navigator.clipboard.writeText(r.text);
+  } catch (err) {
+    setMessage(`Copy failed: ${err.message}`, "error");
+    return;
+  }
+  setMessage(`Copied ${atoms ? `${atoms.length} atoms` : "the structure"} (${r.smiles}).`);
+  if (cut && atoms) await serverEdit({ type: "delete", atoms });
+}
+
+async function paste() {
+  if (!canEdit()) return;
+  const d = dim();
+  const body = { dim: d };
+  if (!window.minimolDesktop) {
+    try {
+      body.text = await navigator.clipboard.readText();
+    } catch (err) {
+      setMessage(`The browser did not allow reading the clipboard (${err.message}).`, "error");
+      return;
+    }
+  }
+  const r = await busyCall("Pasting…", () => api("/api/paste", body));
+  if (!r) return;
+  insertMolecule(r.molecule, d);
+  showNotes(r.notes, `Pasted from ${r.source}.`);
+}
+
 // ------------------------------------------------------------- edits
 
 function deleteTarget(pick) {
@@ -344,25 +452,18 @@ function changeCharge(atoms, delta) {
 
 async function hotkey(key) {
   const t = state.target;
-  if (!t) return false;
+  if (!t) return;
   if (t.kind === "bond") {
-    if (!["1", "2", "3"].includes(key)) return false;
+    const spec = state.bondKeys.get(key);
     const b = model().bonds[t.index];
-    await serverEdit({ type: "bond_order", a: b.a, b: b.b, order: Number(key) });
-    return true;
+    if (spec.op === "order") await serverEdit({ type: "bond_order", a: b.a, b: b.b, order: spec.order });
+    else await serverEdit({ type: "fuse", a: b.a, b: b.b, size: spec.size, aromatic: spec.aromatic });
+    return;
   }
-  if (key === "+" || key === "=") {
-    changeCharge([t.index], +1);
-    return true;
-  }
-  if (key === "-") {
-    changeCharge([t.index], -1);
-    return true;
-  }
-  if (!state.fragments.has(key)) return false;
+  if (key === "+" || key === "=") return changeCharge([t.index], +1);
+  if (key === "-") return changeCharge([t.index], -1);
   const r = await serverEdit({ type: "fragment", atom: t.index, key });
   if (r && r.focus !== null) setTarget({ kind: "atom", index: r.focus });
-  return true;
 }
 
 // ------------------------------------------------------------- display
@@ -377,15 +478,22 @@ function describe(pick) {
   if (pick.kind === "atom") {
     const a = m.atoms[pick.index];
     const nb = M.neighbors(m, pick.index).length;
-    return `${a.el}${pick.index + 1} · ${nb} bond${nb === 1 ? "" : "s"}${a.charge ? ` · charge ${a.charge > 0 ? "+" : ""}${a.charge}` : ""}`;
+    return (
+      `${a.el}${pick.index + 1} · ${nb} bond${nb === 1 ? "" : "s"}` +
+      (a.h ? ` · ${a.h} H` : "") +
+      (a.charge ? ` · charge ${a.charge > 0 ? "+" : ""}${a.charge}` : "") +
+      (a.bad ? " · too many bonds" : "")
+    );
   }
   const b = m.bonds[pick.index];
-  return `bond ${atomLabel(b.a)}–${atomLabel(b.b)} · order ${b.order} · ${M.distance(M.pos(m.atoms[b.a]), M.pos(m.atoms[b.b])).toFixed(3)} Å`;
+  const length = dimOf(m) === 2 ? "" : ` · ${M.distance(M.pos(m.atoms[b.a]), M.pos(m.atoms[b.b])).toFixed(3)} Å`;
+  return `bond ${atomLabel(b.a)}–${atomLabel(b.b)} · order ${b.order}${length}`;
 }
 
 function measurementText() {
   const m = model();
   const s = state.selection;
+  if (dimOf(m) === 2) return s.length ? `${s.length} atom${s.length === 1 ? "" : "s"} selected` : "";
   const p = (i) => M.pos(m.atoms[i]);
   switch (s.length) {
     case 0:
@@ -411,6 +519,7 @@ function hasUnsavedChanges() {
 
 function updateUI() {
   const m = model();
+  const flat = dimOf(m) === 2;
   const n = m.atoms.length;
   const q = M.totalCharge(m);
   $("info").textContent = n ? `${M.formula(m)} · ${n} atom${n === 1 ? "" : "s"} · charge ${q > 0 ? "+" : ""}${q}` : "Empty";
@@ -425,16 +534,27 @@ function updateUI() {
   $("viewport").className = `tool-${state.tool}`;
   $("keep-h").checked = state.keepH;
   $("hotkeys").checked = state.hotkeys;
+  $("mode-3d").classList.toggle("active", !flat);
+  $("mode-2d").classList.toggle("active", flat);
 
   const locked = state.busy && !$("busy").hidden;
-  for (const el of document.querySelectorAll("[data-edit], #method, #uhf, #fix-selected, #smiles, #element-other")) {
+  for (const el of document.querySelectorAll("[data-edit], #method, #uhf, #fix-selected, #smiles, #element-other, #keep-h")) {
     el.disabled = locked;
   }
   if (!locked) {
     $("btn-undo").disabled = !history.canUndo;
     $("btn-redo").disabled = !history.canRedo;
   }
-  $("uhf-wrap").hidden = $("method").value !== "g-xTB";
+  // 2D drawings: hydrogens are implicit and "optimize" means "clean up".
+  $("btn-addh").disabled = locked || flat;
+  $("keep-h").disabled = locked || flat;
+  $("method").disabled = locked || flat;
+  $("fix-selected").disabled = locked || flat;
+  $("btn-opt").textContent = flat ? "Clean up" : "Optimize";
+  $("btn-opt").title = flat ? "Lay out the drawing again (Ctrl+R)" : "Optimize the geometry (Ctrl+R)";
+  for (const opt of $("save-format").options) opt.disabled = flat && (opt.value === "xyz" || opt.value === "pdb");
+  if ($("save-format").selectedOptions[0]?.disabled) $("save-format").value = "mol";
+  $("uhf-wrap").hidden = flat || $("method").value !== "g-xTB";
 }
 
 function setTool(tool) {
@@ -457,6 +577,11 @@ function dragTarget(i, clientX, clientY) {
   const p = M.pos(a);
   const d = M.vec.sub(viewer.screenToModel(clientX, clientY, p), p);
   if (M.vec.len(d) < 1e-6) return null;
+  if (dim() === 2) {
+    // ChemDraw-style: bonds snap to 30 degree steps and have one length.
+    const angle = Math.round(Math.atan2(d[1], d[0]) / (Math.PI / 6)) * (Math.PI / 6);
+    return [p[0] + FLAT_BOND * Math.cos(angle), p[1] + FLAT_BOND * Math.sin(angle), 0];
+  }
   return M.vec.add(p, M.vec.scale(M.vec.norm(d), bondLength(a.el, state.element)));
 }
 
@@ -514,20 +639,33 @@ function handleBondDrag(i, e) {
 }
 
 let drag = null;
-const canvas = viewer.canvas;
 
-canvas.addEventListener("pointerdown", (e) => {
+function onPointerDown(e) {
+  const canvas = e.currentTarget;
   if (drag) return;
+  canvas.focus({ preventScroll: true });
   canvas.setPointerCapture(e.pointerId);
   const pick = viewer.pick(e.clientX, e.clientY);
-  let mode = "rotate";
+  let mode = dim() === 2 ? "box" : "rotate"; // in 2D, dragging on empty space selects
   if (e.button === 0 && (e.ctrlKey || e.metaKey)) mode = "box";
   else if (e.button === 1 || e.button === 2 || e.shiftKey) mode = "pan";
   else if (state.tool === "draw" && pick && pick.kind === "atom" && !state.busy) mode = "bond";
-  drag = { id: e.pointerId, button: e.button, x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY, mode, pick, moved: false };
-});
+  drag = {
+    id: e.pointerId,
+    canvas,
+    button: e.button,
+    x0: e.clientX,
+    y0: e.clientY,
+    x: e.clientX,
+    y: e.clientY,
+    mode,
+    pick,
+    moved: false,
+    ctrl: e.ctrlKey || e.metaKey,
+  };
+}
 
-canvas.addEventListener("pointermove", (e) => {
+function onPointerMove(e) {
   state.pointer = { x: e.clientX, y: e.clientY };
   if (!drag) {
     setTarget(viewer.pick(e.clientX, e.clientY));
@@ -552,7 +690,7 @@ canvas.addEventListener("pointermove", (e) => {
     const to = onAtom ? M.pos(model().atoms[target.index]) : dragTarget(i, e.clientX, e.clientY);
     viewer.setGhost(from, to);
   }
-});
+}
 
 function showBox(x0, y0, x1, y1) {
   const rect = $("viewport").getBoundingClientRect();
@@ -568,15 +706,18 @@ function endDrag(e, cancelled) {
   if (!drag || e.pointerId !== drag.id) return;
   const d = drag;
   drag = null;
-  if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+  if (d.canvas.hasPointerCapture(e.pointerId)) d.canvas.releasePointerCapture(e.pointerId);
   viewer.setGhost(null);
   $("selbox").hidden = true;
   if (cancelled) return;
-  if (d.mode === "box") {
-    if (d.moved) {
-      const inside = viewer.atomsInRect(d.x0, d.y0, e.clientX, e.clientY);
-      setSelection(e.shiftKey ? [...state.selection, ...inside] : inside);
-    } else if (d.pick) {
+  if (d.mode === "box" && d.moved) {
+    const inside = viewer.atomsInRect(d.x0, d.y0, e.clientX, e.clientY);
+    setSelection(e.shiftKey ? [...state.selection, ...inside] : inside);
+    return;
+  }
+  if (!d.moved && d.button === 0 && d.ctrl) {
+    // Ctrl+click toggles an atom (or both atoms of a bond) in the selection.
+    if (d.pick) {
       const m = model();
       toggleSelected(d.pick.kind === "atom" ? [d.pick.index] : [m.bonds[d.pick.index].a, m.bonds[d.pick.index].b]);
     }
@@ -587,22 +728,27 @@ function endDrag(e, cancelled) {
   else if (d.moved && d.mode === "bond") handleBondDrag(d.pick.index, e);
 }
 
-canvas.addEventListener("pointerup", (e) => endDrag(e, false));
-canvas.addEventListener("pointercancel", (e) => endDrag(e, true));
-canvas.addEventListener("pointerleave", () => {
-  state.pointer = null;
-  if (!drag) setTarget(null);
-});
-canvas.addEventListener("contextmenu", (e) => e.preventDefault());
-canvas.addEventListener(
-  "wheel",
-  (e) => {
-    e.preventDefault();
-    const scale = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
-    viewer.zoom(Math.exp(Math.max(-200, Math.min(200, e.deltaY * scale)) * 0.0015));
-  },
-  { passive: false },
-);
+for (const v of Object.values(viewers)) {
+  const canvas = v.canvas;
+  canvas.addEventListener("pointerdown", onPointerDown);
+  canvas.addEventListener("pointermove", onPointerMove);
+  canvas.addEventListener("pointerup", (e) => endDrag(e, false));
+  canvas.addEventListener("pointercancel", (e) => endDrag(e, true));
+  canvas.addEventListener("pointerleave", () => {
+    state.pointer = null;
+    if (!drag) setTarget(null);
+  });
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+  canvas.addEventListener(
+    "wheel",
+    (e) => {
+      e.preventDefault();
+      const scale = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
+      viewer.zoom(Math.exp(Math.max(-200, Math.min(200, e.deltaY * scale)) * 0.0015), e.clientX, e.clientY);
+    },
+    { passive: false },
+  );
+}
 
 // Drag and drop a file onto the view.
 const viewport = $("viewport");
@@ -619,14 +765,25 @@ viewport.addEventListener("drop", (e) => {
 
 // ---------------------------------------------------------- keyboard
 
+function hotkeyApplies(key) {
+  if (!state.hotkeys || !state.target) return false;
+  if (state.target.kind === "bond") return state.bondKeys.has(key);
+  return state.fragments.has(key) || key === "+" || key === "=" || key === "-";
+}
+
 window.addEventListener("keydown", (e) => {
   const t = e.target;
-  const typing = t instanceof HTMLElement && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT") && t.type !== "checkbox";
+  const typing = t instanceof HTMLElement && (t.tagName === "INPUT" || t.tagName === "TEXTAREA") && t.type !== "checkbox";
   const mod = e.ctrlKey || e.metaKey;
   const key = e.key.toLowerCase();
   if (typing) {
     if (e.key === "Escape") t.blur();
     return;
+  }
+  if (t instanceof HTMLElement && t.tagName === "SELECT" && !mod) {
+    // Arrow keys etc. belong to the drop-down; give other keys back to the editor.
+    if (e.key.startsWith("Arrow") || e.key === "Enter" || e.key === " ") return;
+    t.blur();
   }
   if (mod) {
     const actions = {
@@ -634,6 +791,9 @@ window.addEventListener("keydown", (e) => {
       y: redo,
       s: save,
       r: optimize,
+      c: () => copySelection(),
+      x: () => copySelection({ cut: true }),
+      v: paste,
       o: () => canEdit() && $("file-input").click(),
       a: () => setSelection(model().atoms.map((_, i) => i)),
     };
@@ -644,6 +804,11 @@ window.addEventListener("keydown", (e) => {
     return;
   }
   if (e.altKey) return;
+  if (e.key === "Tab") {
+    e.preventDefault();
+    switchMode(dim() === 2 ? 3 : 2);
+    return;
+  }
   if (e.key === "Delete" || e.key === "Backspace") {
     e.preventDefault();
     if (state.selection.length) serverEdit({ type: "delete", atoms: state.selection });
@@ -658,13 +823,10 @@ window.addEventListener("keydown", (e) => {
     } else setSelection([]);
     return;
   }
-  if (state.hotkeys && state.target && !e.repeat) {
-    const known = state.target.kind === "bond" ? ["1", "2", "3"].includes(e.key) : state.fragments.has(e.key) || "+=-".includes(e.key);
-    if (known) {
-      e.preventDefault();
-      hotkey(e.key);
-      return;
-    }
+  if (hotkeyApplies(e.key)) {
+    e.preventDefault();
+    if (!e.repeat) hotkey(e.key);
+    return;
   }
   if (e.key === "1") setTool("select");
   else if (e.key === "2") setTool("draw");
@@ -701,11 +863,14 @@ $("element-other").addEventListener("change", (e) => {
     return;
   }
   e.target.value = sym;
+  e.target.blur();
   setElement(sym);
   setMessage(`Drawing ${sym}.`);
 });
 for (const b of document.querySelectorAll("[data-tool]")) b.addEventListener("click", () => setTool(b.dataset.tool));
 
+$("mode-3d").addEventListener("click", () => switchMode(3));
+$("mode-2d").addEventListener("click", () => switchMode(2));
 $("btn-open").addEventListener("click", () => canEdit() && $("file-input").click());
 $("file-input").addEventListener("change", (e) => {
   const file = e.target.files[0];
@@ -721,48 +886,61 @@ $("smiles-form").addEventListener("submit", (e) => {
 });
 $("btn-addh").addEventListener("click", addHydrogens);
 $("btn-opt").addEventListener("click", optimize);
-$("method").addEventListener("change", updateUI);
+for (const id of ["method", "save-format"]) {
+  $(id).addEventListener("change", (e) => {
+    updateUI();
+    e.target.blur(); // hand the keyboard back to the view (hotkeys)
+  });
+}
 $("btn-reset").addEventListener("click", () => viewer.fit(model(), false));
 $("btn-clear").addEventListener("click", () => {
   if (!canEdit()) return;
   state.selection = [];
-  commit(M.emptyModel(), { view: "reset" });
+  commit(withDim(M.emptyModel(), dim()), { view: "reset" });
 });
 $("btn-charge-minus").addEventListener("click", () => changeCharge(state.selection, -1));
 $("btn-charge-plus").addEventListener("click", () => changeCharge(state.selection, +1));
 $("keep-h").addEventListener("change", (e) => {
   state.keepH = e.target.checked;
   saveSetting("keepH", state.keepH);
-  e.target.blur(); // give keys back to the view
+  e.target.blur();
 });
 $("hotkeys").addEventListener("change", (e) => {
   state.hotkeys = e.target.checked;
   saveSetting("hotkeys", state.hotkeys);
   e.target.blur();
 });
+// Buttons keep focus after a click; blur them so Space/Enter do not re-trigger them.
+document.addEventListener("click", (e) => {
+  if (e.target instanceof HTMLButtonElement) e.target.blur();
+});
 
-function showFragmentKeys(fragments) {
-  for (const f of fragments) state.fragments.set(f.key, f);
-  for (const mode of ["attach", "replace"]) {
-    const box = $(`keys-${mode}`);
-    box.textContent = "";
-    // Keys that share a name are listed together, e.g. "3 a phenyl".
-    const groups = new Map();
-    for (const f of fragments.filter((x) => x.mode === mode)) {
-      if (!groups.has(f.name)) groups.set(f.name, []);
-      groups.get(f.name).push(f.key);
-    }
-    for (const [name, keys] of groups) {
-      const span = document.createElement("span");
-      for (const k of keys) {
-        const kbd = document.createElement("kbd");
-        kbd.textContent = k;
-        span.appendChild(kbd);
-      }
-      span.appendChild(document.createTextNode(` ${name}`));
-      box.appendChild(span);
-    }
+function keyList(box, items) {
+  box.textContent = "";
+  // Keys that share a name are listed together, e.g. "3 a phenyl".
+  const groups = new Map();
+  for (const it of items) {
+    if (!groups.has(it.name)) groups.set(it.name, []);
+    groups.get(it.name).push(it.key);
   }
+  for (const [name, keys] of groups) {
+    const span = document.createElement("span");
+    for (const k of keys) {
+      const kbd = document.createElement("kbd");
+      kbd.textContent = k;
+      span.appendChild(kbd);
+    }
+    span.appendChild(document.createTextNode(` ${name}`));
+    box.appendChild(span);
+  }
+}
+
+function showKeys(fragments, bondKeys) {
+  for (const f of fragments) state.fragments.set(f.key, f);
+  for (const b of bondKeys) state.bondKeys.set(b.key, b);
+  keyList($("keys-attach"), fragments.filter((f) => f.mode === "attach"));
+  keyList($("keys-replace"), fragments.filter((f) => f.mode === "replace"));
+  keyList($("keys-bond"), bondKeys);
 }
 
 // ------------------------------------------------------------ start-up
@@ -776,7 +954,7 @@ async function start() {
     setMessage(err.message, "error");
     return;
   }
-  showFragmentKeys(info.fragments || []);
+  showKeys(info.fragments || [], info.bond_keys || []);
   const select = $("method");
   for (const m of info.methods) select.add(new Option(m, m));
   if (!info.methods.includes("g-xTB")) {
@@ -802,6 +980,16 @@ async function start() {
 // Used by the desktop window to ask before closing.
 window.minimolHasUnsavedChanges = hasUnsavedChanges;
 // Exposed for automated tests only.
-window.__minimol = { state, history, viewer, model, commit, M };
+window.__minimol = {
+  state,
+  history,
+  viewers,
+  get viewer() {
+    return viewer;
+  },
+  model,
+  commit,
+  M,
+};
 
 start();

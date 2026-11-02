@@ -30,8 +30,8 @@ from rdkit.Geometry import Point3D
 RDLogger.DisableLog("rdApp.*")
 
 FORCE_FIELDS = ("MMFF94", "MMFF94s", "UFF")
-EXPORT_FORMATS = ("xyz", "mol", "sdf", "pdb")
-IMPORT_EXTENSIONS = ("xyz", "mol", "sdf", "sd", "mol2", "pdb", "ent")
+EXPORT_FORMATS = ("xyz", "mol", "sdf", "pdb", "cdxml")
+IMPORT_EXTENSIONS = ("xyz", "mol", "sdf", "sd", "mol2", "pdb", "ent", "cdxml")
 
 _ORDER_TO_TYPE = {
     1: Chem.BondType.SINGLE,
@@ -356,19 +356,36 @@ def optimize(
 
 def _extension(name: object) -> str:
     if not isinstance(name, str) or "." not in name:
-        raise ChemError("File name needs an extension (.xyz, .mol, .sdf, .mol2 or .pdb)")
+        raise ChemError("File name needs an extension (.xyz, .mol, .sdf, .mol2, .pdb or .cdxml)")
     ext = name.rsplit(".", 1)[1].lower()
+    if ext == "cdx":
+        raise ChemError(
+            "Binary ChemDraw files (.cdx) cannot be read with the installed RDKit; "
+            "save the drawing as .cdxml or .mol in ChemDraw instead."
+        )
     if ext not in IMPORT_EXTENSIONS:
-        raise ChemError(f"Unsupported file type '.{ext}'. Supported: .xyz, .mol, .sdf, .mol2, .pdb")
+        raise ChemError(f"Unsupported file type '.{ext}'. Supported: .xyz, .mol, .sdf, .mol2, .pdb, .cdxml")
     return ext
 
 
-def import_text(name: object, text: object) -> tuple[dict, list[str]]:
-    """Parse a molecule file. Returns the molecule and user-facing notes."""
+def read_file(name: object, text: object, notes: list[str]) -> tuple[Chem.Mol, str]:
+    """Parse a molecule file into an RDKit molecule (coordinates as in the file). Returns (mol, extension)."""
     ext = _extension(name)
     if not isinstance(text, str) or not text.strip():
         raise ChemError("The file is empty")
-    notes: list[str] = []
+    if ext == "cdxml":
+        try:
+            mols = [m for m in Chem.MolsFromCDXML(text, removeHs=False) if m is not None and m.GetNumAtoms()]
+        except Exception:
+            mols = []
+        if not mols:
+            raise ChemError("Could not read a structure from the CDXML file")
+        if len(mols) > 1:
+            notes.append(f"The file holds {len(mols)} structures; all were loaded.")
+        mol = mols[0]
+        for other in mols[1:]:
+            mol = Chem.CombineMols(mol, other)
+        return mol, ext
     if ext == "xyz":
         mol = _read_xyz(text, notes)
     elif ext in ("mol", "sdf", "sd"):
@@ -388,8 +405,23 @@ def import_text(name: object, text: object) -> tuple[dict, list[str]]:
         raise ChemError("The file contains no atoms")
     if mol.GetNumConformers() == 0:
         raise ChemError("The file contains no coordinates")
-    if ext in ("mol", "sdf", "sd") and not mol.GetConformer().Is3D():
-        mol = _embed_3d(mol)
+    return mol, ext
+
+
+def import_text(name: object, text: object, dim: int = 3) -> tuple[dict, list[str]]:
+    """Parse a molecule file for the 3D editor or (dim=2) as a 2D drawing. Returns (molecule, notes)."""
+    notes: list[str] = []
+    mol, ext = read_file(name, text, notes)
+    if dim == 2:
+        from . import layout  # imported here: layout depends on this module
+
+        return layout.from_rdkit_2d(mol, notes), notes
+    if ext in ("mol", "sdf", "sd", "cdxml") and not mol.GetConformer().Is3D():
+        mol = Chem.RWMol(mol)
+        for a in mol.GetAtoms():
+            a.SetNoImplicit(False)
+        Chem.SanitizeMol(mol)
+        mol = _embed_3d(Chem.RemoveHs(mol))
         notes.append("The file had 2D coordinates; generated a 3D structure (hydrogens added).")
     return mol_to_json(mol, notes), notes
 
@@ -470,11 +502,29 @@ def _read_mol_or_sdf(text: str, notes: list[str]) -> Chem.Mol:
     return mol
 
 
-def export_text(data: object, fmt: object, title: str = "minimol") -> str:
-    """Write a molecule as XYZ, MOL, SDF or PDB text."""
+def export_text(data: object, fmt: object, title: str = "minimol", dim: int = 3) -> str:
+    """Write a molecule as XYZ, MOL, SDF, PDB or CDXML text. ``dim=2``: a 2D drawing (implicit H)."""
     if fmt not in EXPORT_FORMATS:
         raise ChemError(f"Unsupported export format {fmt!r}")
     validate_json(data)
+    if fmt == "cdxml" or dim == 2:
+        from . import layout  # imported here: layout depends on this module
+
+        mol = layout.strip_hydrogens(mol_from_json(data, sanitize=False))
+        for a in mol.GetAtoms():
+            a.SetNoImplicit(a.GetAtomicNum() == 1)  # drawings keep hydrogens implicit
+        mol.UpdatePropertyCache(strict=False)
+        if dim == 2:
+            mol.GetConformer().Set3D(False)
+        else:
+            layout.depict(mol)
+        mol.SetProp("_Name", title)
+        if fmt == "cdxml":
+            return Chem.MolToCDXMLBlock(mol)
+        if fmt in ("mol", "sdf"):
+            block = Chem.MolToMolBlock(mol)
+            return block + "$$$$\n" if fmt == "sdf" else block
+        raise ChemError(f"A 2D drawing cannot be saved as .{fmt}; use .mol, .sdf or .cdxml")
     if fmt == "xyz":
         atoms = data["atoms"]
         lines = [str(len(atoms)), title]

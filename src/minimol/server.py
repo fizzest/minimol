@@ -23,7 +23,7 @@ from pathlib import Path
 
 from rdkit import rdBase
 
-from . import __version__, chem, edit, gxtb
+from . import __version__, chem, clipboard, edit, gxtb, layout
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY = 64 * 1024 * 1024  # bytes
@@ -56,6 +56,9 @@ class MinimolServer(ThreadingHTTPServer):
         super().__init__(address, Handler)
         self.static_files = _static_files()
         self.initial_file = initial_file
+        # Set by the desktop window: reads and writes the system clipboard.
+        # Without it (browser mode) the page uses the browser's text clipboard.
+        self.clipboard = None
         # One optimization at a time: g-xTB is multi-threaded on its own.
         self.optimize_lock = threading.Lock()
 
@@ -161,21 +164,36 @@ def api_info(server: MinimolServer, body: dict) -> dict:
         "gxtb": binary,
         "export_formats": list(chem.EXPORT_FORMATS),
         "fragments": edit.fragment_list(),
+        "bond_keys": edit.bond_key_list(),
+        "cdx": clipboard.cdx_supported(),
+        "system_clipboard": server.clipboard is not None,
     }
 
 
+def _dim(body: dict) -> int:
+    dim = body.get("dim", 3)
+    if dim not in (2, 3):
+        raise chem.ChemError("dim must be 2 or 3")
+    return dim
+
+
 def api_import(server: MinimolServer, body: dict) -> dict:
-    molecule, notes = chem.import_text(body.get("name"), body.get("text"))
+    molecule, notes = chem.import_text(body.get("name"), body.get("text"), _dim(body))
     return {"molecule": molecule, "notes": notes}
 
 
 def api_export(server: MinimolServer, body: dict) -> dict:
     title = body.get("title") if isinstance(body.get("title"), str) else "minimol"
     title = " ".join(title.split())[:70] or "minimol"
-    return {"text": chem.export_text(body.get("molecule"), body.get("format"), title)}
+    return {"text": chem.export_text(body.get("molecule"), body.get("format"), title, _dim(body))}
 
 
 def api_smiles(server: MinimolServer, body: dict) -> dict:
+    if _dim(body) == 2:
+        smiles = body.get("smiles")
+        if not isinstance(smiles, str) or not smiles.strip():
+            raise chem.ChemError("Enter a SMILES string")
+        return layout.smiles_2d(smiles.strip())
     molecule, notes = chem.from_smiles(body.get("smiles"))
     return {"molecule": molecule, "notes": notes}
 
@@ -186,7 +204,41 @@ def api_addh(server: MinimolServer, body: dict) -> dict:
 
 
 def api_edit(server: MinimolServer, body: dict) -> dict:
-    return edit.apply_edit(body.get("molecule"), body.get("op"), body.get("keep_h", True), body.get("view"))
+    return edit.apply_edit(body.get("molecule"), body.get("op"), body.get("keep_h", True), body.get("view"), _dim(body))
+
+
+def api_convert(server: MinimolServer, body: dict) -> dict:
+    to = body.get("to")
+    if to == 2:
+        return layout.to_2d(body.get("molecule"))
+    if to == 3:
+        return layout.to_3d(body.get("molecule"))
+    raise chem.ChemError("to must be 2 or 3")
+
+
+def api_clean2d(server: MinimolServer, body: dict) -> dict:
+    return layout.clean_2d(body.get("molecule"))
+
+
+def api_copy(server: MinimolServer, body: dict) -> dict:
+    p = clipboard.payload(body.get("molecule"), body.get("atoms"), _dim(body))
+    if server.clipboard is not None:
+        server.clipboard.set(clipboard.copy_formats(p))
+        return {"target": "system", "smiles": p["smiles"]}
+    return {"target": "text", "text": p["smiles"], "smiles": p["smiles"]}
+
+
+def api_paste(server: MinimolServer, body: dict) -> dict:
+    text = body.get("text")
+    if text is not None:
+        if not isinstance(text, str):
+            raise chem.ChemError("text must be a string")
+        formats = {"text/plain": text.encode()}
+    elif server.clipboard is not None:
+        formats = server.clipboard.get()
+    else:
+        raise chem.ChemError("No clipboard text was given")
+    return clipboard.paste(formats, _dim(body))
 
 
 def api_optimize(server: MinimolServer, body: dict) -> dict:
@@ -213,7 +265,7 @@ def api_initial(server: MinimolServer, body: dict) -> dict:
         text = Path(path).read_text(errors="replace")
     except OSError as exc:
         raise chem.ChemError(f"Could not open {path}: {exc.strerror}") from None
-    molecule, notes = chem.import_text(os.path.basename(path), text)
+    molecule, notes = chem.import_text(os.path.basename(path), text, _dim(body))
     return {"molecule": molecule, "notes": notes, "name": os.path.basename(path)}
 
 
@@ -224,6 +276,10 @@ ROUTES = {
     "/api/smiles": api_smiles,
     "/api/addh": api_addh,
     "/api/edit": api_edit,
+    "/api/convert": api_convert,
+    "/api/clean2d": api_clean2d,
+    "/api/copy": api_copy,
+    "/api/paste": api_paste,
     "/api/optimize": api_optimize,
     "/api/initial": api_initial,
 }
