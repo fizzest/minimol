@@ -29,7 +29,7 @@
       <button type="submit" data-edit title="Build a 3D structure from SMILES and add it">Insert</button>
     </form>
     <div class="group">
-      <button id="btn-addh" data-edit title="Fill open valences with hydrogens">Add H</button>
+      <button id="btn-addh" data-edit title="Fill every open valence with hydrogens">Add H</button>
       <select id="method" title="Optimization method" aria-label="Optimization method"></select>
       <label id="uhf-wrap" hidden title="Number of unpaired electrons for g-xTB (blank = automatic: singlet or doublet)">
         unpaired e⁻ <input id="uhf" type="number" min="0" step="1" placeholder="auto">
@@ -37,7 +37,7 @@
       <label title="Keep the selected atoms fixed during optimization">
         <input type="checkbox" id="fix-selected"> fix selected
       </label>
-      <button id="btn-opt" data-edit class="primary" title="Optimize the geometry">Optimize</button>
+      <button id="btn-opt" data-edit class="primary" title="Optimize the geometry (Ctrl+R)">Optimize</button>
     </div>
     <div class="group">
       <button id="btn-reset" title="Reset view (R)">Reset view</button>
@@ -56,27 +56,48 @@
       <h3>Element</h3>
       <div id="elements"></div>
       <input id="element-other" placeholder="other: Fe, Si…" maxlength="3" spellcheck="false" aria-label="Other element">
-      <h3>Charge of selection</h3>
+      <h3>Charge</h3>
       <div class="row">
-        <button id="btn-charge-minus" data-edit title="Decrease formal charge (−)">−</button>
-        <button id="btn-charge-plus" data-edit title="Increase formal charge (+)">+</button>
+        <button id="btn-charge-minus" data-edit title="Decrease the formal charge of the selected atoms (−)">−</button>
+        <button id="btn-charge-plus" data-edit title="Increase the formal charge of the selected atoms (+)">+</button>
       </div>
+      <h3>Options</h3>
+      <label class="option" title="New atoms come with hydrogens, and edited atoms keep the right number of hydrogens">
+        <input type="checkbox" id="keep-h" checked> Keep hydrogens
+      </label>
+      <label class="option" title="Hover an atom or bond and press a key to add a group (ChemDraw-style)">
+        <input type="checkbox" id="hotkeys" checked> Fragment hotkeys
+      </label>
+      <details id="hotkey-help">
+        <summary>Fragment hotkeys</summary>
+        <p>Hover an atom and press a key.</p>
+        <p class="sub">Add to the atom</p>
+        <div id="keys-attach" class="keys"></div>
+        <p class="sub">The atom becomes</p>
+        <div id="keys-replace" class="keys"></div>
+        <p class="sub">On a bond</p>
+        <div class="keys"><span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> bond order</span></div>
+        <p class="sub">On an atom</p>
+        <div class="keys"><span><kbd>+</kbd><kbd>−</kbd> charge</span><span><kbd>Del</kbd> delete</span></div>
+        <p>After a key, the new group becomes the target, so keys can be chained: on methane, <kbd>1</kbd><kbd>1</kbd><kbd>o</kbd> adds two carbons and turns the last one into OH (ethanol). Moving the mouse picks a new target.</p>
+      </details>
       <details id="help">
-        <summary>Help</summary>
+        <summary>Mouse &amp; keys</summary>
         <ul>
           <li><b>Rotate:</b> left-drag on empty space</li>
           <li><b>Pan:</b> right-drag or Shift+drag</li>
           <li><b>Zoom:</b> mouse wheel / pinch</li>
-          <li><b>Draw:</b> click empty space for a new atom; click an atom to grow a bond; drag from atom to atom to bond them; click an atom of another element to change it; click a bond to cycle single/double/triple</li>
-          <li><b>Delete:</b> click an atom or bond (an atom takes its hydrogens with it)</li>
-          <li><b>Select:</b> click atoms (Shift adds); 2/3/4 atoms show distance/angle/dihedral</li>
-          <li><b>Keys:</b> Ctrl+Z / Ctrl+Shift+Z undo/redo, Del delete selection, Ctrl+A select all, Esc clear selection, R reset view, H C N O F P S pick element</li>
+          <li><b>Draw:</b> click empty space for a new atom; click an atom to grow a bond (replaces an H if the atom is full); drag from an atom to place one, or onto another atom to bond them; click an atom of another element to change it; click a bond to cycle single/double/triple</li>
+          <li><b>Delete:</b> right-click an atom or bond (Draw or Delete tool), or click it with the Delete tool</li>
+          <li><b>Select:</b> Ctrl+drag a box (Ctrl+Shift+drag adds); Ctrl+click toggles one atom; with the Select tool, click (Shift adds). 2/3/4 atoms show distance/angle/dihedral</li>
+          <li><b>Keys:</b> Ctrl+R optimize, Ctrl+Z / Ctrl+Shift+Z undo/redo, Del delete, Ctrl+A select all, Esc clear selection, R reset view</li>
         </ul>
       </details>
     </aside>
 
     <div id="viewport">
       <div id="hint">Click to place an atom, drag from an atom to grow a bond,<br>open a file, or type a SMILES above.</div>
+      <div id="selbox" hidden></div>
       <div id="busy" hidden><div class="spinner"></div><span id="busy-text"></span></div>
     </div>
   </div>

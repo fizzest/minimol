@@ -67,7 +67,7 @@ label { display: flex; align-items: center; gap: 4px; color: var(--muted); user-
 #main { flex: 1; display: flex; min-height: 0; }
 
 #sidebar {
-  width: 168px;
+  width: 184px;
   padding: 8px 10px;
   background: var(--panel);
   border-right: 1px solid var(--line);
@@ -160,3 +160,30 @@ kbd { font: 11px ui-monospace, monospace; color: var(--muted); }
 #message { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
 #message.error { color: var(--error); }
 #message.warn { color: var(--warn); }
+
+.option { color: var(--text); margin-bottom: 4px; }
+
+#hotkey-help { margin-top: 12px; color: var(--muted); }
+#hotkey-help summary { cursor: pointer; color: var(--text); }
+#hotkey-help p { margin: 6px 0 4px; }
+#hotkey-help p.sub { margin-top: 8px; font-weight: 600; color: var(--text); }
+.keys { display: flex; flex-wrap: wrap; gap: 3px 8px; }
+.keys span { white-space: nowrap; }
+.keys kbd, #hotkey-help p kbd {
+  display: inline-block;
+  min-width: 15px;
+  padding: 0 3px;
+  margin-right: 2px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: #fafaf9;
+  color: var(--text);
+  text-align: center;
+}
+
+#selbox {
+  position: absolute;
+  border: 1px solid var(--accent);
+  background: rgba(37, 99, 235, 0.08);
+  pointer-events: none;
+}

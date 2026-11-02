@@ -1,0 +1,357 @@
+import math
+from collections import Counter
+
+import numpy as np
+import pytest
+
+from minimol import chem
+from minimol.chem import ChemError
+from minimol.edit import FRAGMENTS, apply_edit, template
+
+
+def formula(mol):
+    c = Counter(a["el"] for a in mol["atoms"])
+    order = ["C", "H"] + sorted(k for k in c if k not in ("C", "H"))
+    return "".join(k + (str(c[k]) if c[k] > 1 else "") for k in order if c[k])
+
+
+def P(mol, i):
+    a = mol["atoms"][i]
+    return np.array([a["x"], a["y"], a["z"]])
+
+
+def d(mol, i, j):
+    return float(np.linalg.norm(P(mol, i) - P(mol, j)))
+
+
+def bonded(mol, i, j):
+    return any({b["a"], b["b"]} == {i, j} for b in mol["bonds"])
+
+
+def neighbors(mol, i):
+    return [b["b"] if b["a"] == i else b["a"] for b in mol["bonds"] if i in (b["a"], b["b"])]
+
+
+def edit(mol, keep_h=True, **op):
+    return apply_edit(mol, op, keep_h=keep_h)
+
+
+def min_nonbonded(mol):
+    best = math.inf
+    n = len(mol["atoms"])
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not bonded(mol, i, j):
+                best = min(best, d(mol, i, j))
+    return best
+
+
+def sane(mol):
+    """Valid JSON, passes RDKit sanitization, no atoms on top of each other."""
+    chem.validate_json(mol)
+    chem.mol_from_json(mol)  # raises on valence problems
+    assert min_nonbonded(mol) > 0.9
+
+
+EMPTY = {"atoms": [], "bonds": []}
+
+
+def methane():
+    return edit(EMPTY, type="add_atom", element="C", pos=[0, 0, 0])["molecule"]
+
+
+def ethane():
+    """Ethane and the index of its second carbon (atom 1 is a hydrogen)."""
+    r = edit(methane(), type="grow", atom=0, element="C")
+    return r["molecule"], r["focus"]
+
+
+# ------------------------------------------------------------- new atoms
+
+
+def test_add_atom_with_hydrogens_is_tetrahedral():
+    r = edit(EMPTY, type="add_atom", element="C", pos=[1, 2, 3])
+    m = r["molecule"]
+    assert formula(m) == "CH4" and r["focus"] == 0
+    for h in range(1, 5):
+        assert d(m, 0, h) == pytest.approx(0.76 + 0.31, abs=1e-6)
+    for i in range(1, 5):
+        for j in range(i + 1, 5):
+            v1, v2 = P(m, i) - P(m, 0), P(m, j) - P(m, 0)
+            angle = math.degrees(math.acos(np.dot(v1, v2) / np.linalg.norm(v1) / np.linalg.norm(v2)))
+            assert angle == pytest.approx(109.47, abs=2)
+
+
+@pytest.mark.parametrize("el, charge_op, expected", [("N", None, "H3N"), ("O", None, "H2O"), ("N", 1, "H4N"), ("H", None, "H")])
+def test_add_atom_other_elements(el, charge_op, expected):
+    m = edit(EMPTY, type="add_atom", element=el, pos=[0, 0, 0])["molecule"]
+    if charge_op:
+        m = edit(m, type="charge", atoms=[0], delta=charge_op)["molecule"]
+    assert formula(m) == expected
+    sane(m)
+
+
+def test_add_atom_without_hydrogens():
+    m = edit(EMPTY, keep_h=False, type="add_atom", element="C", pos=[0, 0, 0])["molecule"]
+    assert formula(m) == "C"
+
+
+# ------------------------------------------------------- growing / bonding
+
+
+def test_grow_replaces_a_hydrogen_and_hydrogenates_the_new_atom():
+    m = methane()
+    r = edit(m, type="grow", atom=0, element="C")
+    e = r["molecule"]
+    assert formula(e) == "C2H6"
+    assert r["map"][0] == 0 and r["map"].count(-1) == 1  # exactly one H was replaced
+    j = r["focus"]
+    assert e["atoms"][j]["el"] == "C" and bonded(e, 0, j)
+    assert d(e, 0, j) == pytest.approx(1.52, abs=1e-6)
+    sane(e)
+
+
+def test_grow_into_an_open_valence_keeps_existing_hydrogens():
+    m = {"atoms": [{"el": "C", "x": 0, "y": 0, "z": 0, "charge": 0}], "bonds": []}
+    r = edit(m, keep_h=False, type="grow", atom=0, element="O")
+    assert formula(r["molecule"]) == "CO" and r["map"] == [0]
+
+
+def test_grow_follows_the_drag_direction_hint():
+    m = methane()
+    r = edit(m, type="grow", atom=0, element="C", hint=[0, 0, 1])
+    e = r["molecule"]
+    u = (P(e, r["focus"]) - P(e, 0)) / 1.52
+    assert np.allclose(u, [0, 0, 1])  # placed exactly along the drag direction
+    # ...and the hydrogen that pointed most along +z is the one that was replaced.
+    removed = r["map"].index(-1)
+    assert m["atoms"][removed]["z"] == max(a["z"] for a in m["atoms"][1:])
+
+
+def test_chain_grows_from_focus():
+    m = methane()
+    focus = 0
+    for _ in range(3):
+        r = edit(m, type="grow", atom=focus, element="C")
+        m, focus = r["molecule"], r["focus"]
+    assert formula(m) == "C4H10"
+    sane(m)
+
+
+def test_grow_on_bonded_hydrogen_is_refused():
+    m = methane()
+    with pytest.raises(ChemError, match="hydrogen"):
+        edit(m, type="grow", atom=1, element="C")
+
+
+def test_bond_between_two_methanes_removes_facing_hydrogens():
+    a = methane()
+    b = edit(a, type="add_atom", element="C", pos=[3.0, 0, 0])["molecule"]
+    r = edit(b, type="bond", a=0, b=5)
+    m = r["molecule"]
+    assert formula(m) == "C2H6"
+    new_c = r["map"][5]
+    assert bonded(m, 0, new_c)
+    # The hydrogens that were removed pointed at the other carbon.
+    for h in neighbors(m, 0):
+        if m["atoms"][h]["el"] == "H":
+            assert np.dot(P(m, h) - P(m, 0), [1, 0, 0]) < 0.9
+
+
+def test_bond_errors():
+    m, c2 = ethane()
+    with pytest.raises(ChemError, match="already bonded"):
+        edit(m, type="bond", a=0, b=c2)
+    with pytest.raises(ChemError, match="itself"):
+        edit(m, type="bond", a=0, b=0)
+
+
+# ------------------------------------------------ element, order, charge
+
+
+def test_element_change_fixes_hydrogen_count():
+    m = methane()
+    assert formula(edit(m, type="element", atom=0, element="O")["molecule"]) == "H2O"
+    assert formula(edit(m, type="element", atom=0, element="N")["molecule"]) == "H3N"
+    # Clicking a hydrogen with carbon turns it into a methyl group.
+    e = edit(m, type="element", atom=1, element="C")["molecule"]
+    assert formula(e) == "C2H6"
+    sane(e)
+
+
+def test_element_change_without_keep_h_only_changes_the_element():
+    m = methane()
+    assert formula(edit(m, keep_h=False, type="element", atom=0, element="O")["molecule"]) == "H4O"
+
+
+def test_bond_order_cycle_adjusts_hydrogens():
+    m, c2 = ethane()
+    seen = []
+    for order in (2, 3, 1):
+        r = edit(m, type="bond_order", a=0, b=c2, order=order)
+        m, c2 = r["molecule"], r["map"][c2]
+        seen.append(formula(m))
+        sane(m)
+    assert seen == ["C2H4", "C2H2", "C2H6"]
+    h = next(j for j in neighbors(m, 0) if m["atoms"][j]["el"] == "H")
+    with pytest.raises(ChemError, match="single bond"):
+        edit(m, type="bond_order", a=0, b=h, order=2)
+
+
+def test_charge_adjusts_hydrogens():
+    nh3 = edit(EMPTY, type="add_atom", element="N", pos=[0, 0, 0])["molecule"]
+    nh4 = edit(nh3, type="charge", atoms=[0], delta=1)["molecule"]
+    assert formula(nh4) == "H4N" and nh4["atoms"][0]["charge"] == 1
+    water = edit(EMPTY, type="add_atom", element="O", pos=[0, 0, 0])["molecule"]
+    oh = edit(water, type="charge", atoms=[0], delta=-1)["molecule"]
+    assert formula(oh) == "HO"
+
+
+# -------------------------------------------------------------- deleting
+
+
+def test_delete_heavy_atom_caps_neighbour_with_hydrogen():
+    ethanol, _ = chem.from_smiles("CCO")
+    o = next(i for i, a in enumerate(ethanol["atoms"]) if a["el"] == "O")
+    r = edit(ethanol, type="delete", atoms=[o])
+    assert formula(r["molecule"]) == "C2H6"
+    assert r["map"][o] == -1
+    sane(r["molecule"])
+
+
+def test_delete_hydrogen_leaves_an_open_valence():
+    m = methane()
+    r = edit(m, type="delete", atoms=[1])
+    assert formula(r["molecule"]) == "CH3"
+
+
+def test_delete_bond_caps_both_ends():
+    m, c2 = ethane()
+    r = edit(m, type="delete", bonds=[[0, c2]])
+    assert formula(r["molecule"]) == "C2H8"
+    assert len(r["molecule"]["bonds"]) == 8
+
+
+def test_delete_without_keep_h():
+    ethanol, _ = chem.from_smiles("CCO")
+    o = next(i for i, a in enumerate(ethanol["atoms"]) if a["el"] == "O")
+    assert formula(edit(ethanol, keep_h=False, type="delete", atoms=[o])["molecule"]) == "C2H5"
+
+
+def test_map_tracks_surviving_atoms():
+    ethanol, _ = chem.from_smiles("CCO")
+    o = next(i for i, a in enumerate(ethanol["atoms"]) if a["el"] == "O")
+    r = edit(ethanol, type="delete", atoms=[o])
+    for old, new in enumerate(r["map"]):
+        if new >= 0:
+            assert r["molecule"]["atoms"][new]["el"] == ethanol["atoms"][old]["el"]
+            if ethanol["atoms"][old]["el"] != "H":
+                assert np.allclose(P(r["molecule"], new), P(ethanol, old))
+
+
+# -------------------------------------------------------------- fragments
+
+
+def test_attach_phenyl_to_methane():
+    r = edit(methane(), type="fragment", atom=0, key="3")
+    m = r["molecule"]
+    assert formula(m) == "C7H8"
+    sane(m)
+
+
+def test_label_key_on_terminal_carbon_replaces_it():
+    m, c2 = ethane()
+    r = edit(m, type="fragment", atom=c2, key="o")
+    assert formula(r["molecule"]) == "CH4O"  # the CH3 *becomes* OH: methanol
+    assert r["molecule"]["atoms"][r["focus"]]["el"] == "O"
+    sane(r["molecule"])
+
+
+def test_label_key_on_hydrogen_replaces_that_hydrogen():
+    m = methane()
+    r = edit(m, type="fragment", atom=2, key="o")
+    assert formula(r["molecule"]) == "CH4O"
+    assert r["map"][2] == -1
+    sane(r["molecule"])
+
+
+def test_nitro_group_keeps_charges_and_neutral_total():
+    benzene, _ = chem.from_smiles("c1ccccc1")
+    h = next(i for i, a in enumerate(benzene["atoms"]) if a["el"] == "H")
+    m = edit(benzene, type="fragment", atom=h, key="N")["molecule"]
+    assert formula(m) == "C6H5NO2"
+    assert sum(a["charge"] for a in m["atoms"]) == 0
+    sane(m)
+
+
+def test_label_key_inside_a_ring_changes_the_element():
+    ring, _ = chem.from_smiles("C1CCCCC1")
+    r = edit(ring, type="fragment", atom=0, key="o")
+    assert formula(r["molecule"]) == "C5H10O"
+    sane(r["molecule"])
+    with pytest.raises(ChemError, match="end atoms only"):
+        edit(ring, type="fragment", atom=0, key="F")
+    with pytest.raises(ChemError, match="cannot replace"):
+        edit(ring, type="fragment", atom=0, key="f")
+
+
+def test_label_key_on_isolated_atom():
+    r = edit(methane(), type="fragment", atom=0, key="o")
+    assert formula(r["molecule"]) == "H2O"
+
+
+def test_chain_key_focus_moves_to_new_atom_and_vinyl_to_its_end():
+    r = edit(methane(), type="fragment", atom=0, key="1")
+    assert formula(r["molecule"]) == "C2H6" and r["molecule"]["atoms"][r["focus"]]["el"] == "C"
+    r = edit(methane(), type="fragment", atom=0, key="8")
+    m, f = r["molecule"], r["focus"]
+    assert formula(m) == "C3H6"
+    assert sum(1 for j in neighbors(m, f) if m["atoms"][j]["el"] == "H") == 2  # terminal =CH2
+
+
+def test_fragments_without_hydrogens_in_skeleton_mode():
+    bare = {"atoms": [{"el": "C", "x": 0, "y": 0, "z": 0, "charge": 0}], "bonds": []}
+    assert formula(edit(bare, keep_h=False, type="fragment", atom=0, key="3")["molecule"]) == "C7"
+
+
+def test_fragment_avoids_clashes_with_existing_atoms():
+    # Attach tert-butyl next to an existing tert-butyl: no atoms on top of each other.
+    m, _ = chem.from_smiles("CC(C)(C)C")
+    h = next(i for i, a in enumerate(m["atoms"]) if a["el"] == "H")
+    r = edit(m, type="fragment", atom=h, key="K")
+    assert min_nonbonded(r["molecule"]) > 1.2
+
+
+@pytest.mark.parametrize("frag", FRAGMENTS, ids=lambda f: f.key)
+def test_every_fragment_on_a_methane_hydrogen_is_valid_and_optimizable(frag):
+    r = edit(methane(), type="fragment", atom=1, key=frag.key)
+    m = r["molecule"]
+    sane(m)
+    method = "MMFF94"
+    try:
+        result = chem.optimize(m, method)
+    except ChemError:
+        method = "UFF"
+        result = chem.optimize(m, method)
+    assert math.isfinite(result["energy"])
+    assert r["focus"] is not None
+
+
+@pytest.mark.parametrize("frag", FRAGMENTS, ids=lambda f: f.key)
+def test_every_fragment_template_has_one_attachment(frag):
+    t = template(frag.key)
+    assert t.elements[t.dummy] == "H" and t.attach != t.dummy
+
+
+def test_edit_errors():
+    m = methane()
+    with pytest.raises(ChemError, match="Unknown edit"):
+        apply_edit(m, {"type": "explode"})
+    with pytest.raises(ChemError, match="No fragment"):
+        apply_edit(m, {"type": "fragment", "atom": 0, "key": "%"})
+    with pytest.raises(ChemError, match="does not exist"):
+        apply_edit(m, {"type": "grow", "atom": 9, "element": "C"})
+    with pytest.raises(ChemError, match="view"):
+        apply_edit(m, {"type": "grow", "atom": 0, "element": "C"}, view={"right": [0, 0, 0], "up": [0, 1, 0], "toCamera": [0, 0, 1]})
+    with pytest.raises(ChemError, match="keep_h"):
+        apply_edit(m, {"type": "grow", "atom": 0, "element": "C"}, keep_h="yes")

@@ -23,7 +23,7 @@ from pathlib import Path
 
 from rdkit import rdBase
 
-from . import __version__, chem, gxtb
+from . import __version__, chem, edit, gxtb
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY = 64 * 1024 * 1024  # bytes
@@ -160,6 +160,7 @@ def api_info(server: MinimolServer, body: dict) -> dict:
         "methods": methods,
         "gxtb": binary,
         "export_formats": list(chem.EXPORT_FORMATS),
+        "fragments": edit.fragment_list(),
     }
 
 
@@ -182,6 +183,10 @@ def api_smiles(server: MinimolServer, body: dict) -> dict:
 def api_addh(server: MinimolServer, body: dict) -> dict:
     molecule, notes = chem.add_hydrogens(body.get("molecule"))
     return {"molecule": molecule, "notes": notes}
+
+
+def api_edit(server: MinimolServer, body: dict) -> dict:
+    return edit.apply_edit(body.get("molecule"), body.get("op"), body.get("keep_h", True), body.get("view"))
 
 
 def api_optimize(server: MinimolServer, body: dict) -> dict:
@@ -218,6 +223,7 @@ ROUTES = {
     "/api/export": api_export,
     "/api/smiles": api_smiles,
     "/api/addh": api_addh,
+    "/api/edit": api_edit,
     "/api/optimize": api_optimize,
     "/api/initial": api_initial,
 }

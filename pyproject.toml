@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minimol"
-version = "0.1.0"
-description = "A minimal 3D molecule viewer and editor with MMFF94, UFF and optional g-xTB optimization"
+version = "0.2.0"
+description = "A minimal desktop 3D molecule viewer and editor with fragment hotkeys, MMFF94/UFF and optional g-xTB optimization"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["rdkit>=2023.9.1"]
+# PySide6 (Qt WebEngine) provides the desktop window; tested with 6.12.
+dependencies = ["rdkit>=2023.9.1", "PySide6>=6.12"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

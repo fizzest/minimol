@@ -104,3 +104,15 @@ def test_bad_json_and_unknown_route(server):
     conn.close()
     status, _ = api(server, "/api/nope", {})
     assert status == 404
+
+
+def test_edit_endpoint_and_fragment_list(server):
+    status, info = api(server, "/api/info", {})
+    keys = {f["key"] for f in info["fragments"]}
+    assert {"1", "3", "o", "N", "y"} <= keys
+    status, data = api(server, "/api/edit", {"molecule": {"atoms": [], "bonds": []}, "op": {"type": "add_atom", "element": "C", "pos": [0, 0, 0]}})
+    assert status == 200 and len(data["molecule"]["atoms"]) == 5 and data["focus"] == 0
+    status, data = api(server, "/api/edit", {"molecule": data["molecule"], "op": {"type": "fragment", "atom": 0, "key": "3"}, "keep_h": True})
+    assert status == 200 and len(data["molecule"]["atoms"]) == 15  # toluene
+    status, data = api(server, "/api/edit", {"molecule": data["molecule"], "op": {"type": "nope"}})
+    assert status == 400 and "Unknown edit" in data["error"]

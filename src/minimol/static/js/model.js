@@ -1,13 +1,11 @@
-// The molecule model and every edit on it, as pure functions.
+// The molecule model: queries, validation and measurements.
 //
 // A model is { atoms: [{el, x, y, z, charge}], bonds: [{a, b, order}] }, the
-// same JSON the server speaks. Models are never mutated: each edit returns a
-// new model (unchanged atoms/bonds are shared). That makes undo/redo a plain
-// list of models and lets the app tell whether a result is stale by identity.
+// same JSON the server speaks. Models are never mutated: every edit (done by
+// the server, see edit.py) produces a new model, so undo/redo is a plain list
+// of models and the app can tell whether a result is stale by identity.
 
-import { bondLength, isElement } from "./elements.js";
-
-export const MAX_CHARGE = 8;
+import { isElement } from "./elements.js";
 
 export function emptyModel() {
   return { atoms: [], bonds: [] };
@@ -68,12 +66,6 @@ export function centroid(m) {
   return vec.scale(s, 1 / m.atoms.length);
 }
 
-export function boundingRadius(m, center) {
-  let r = 0;
-  for (const a of m.atoms) r = Math.max(r, vec.len(vec.sub(pos(a), center)));
-  return r;
-}
-
 /** Check a model's structure; returns an error string or null. */
 export function validate(m) {
   if (!m || !Array.isArray(m.atoms) || !Array.isArray(m.bonds)) return "not a model";
@@ -95,107 +87,6 @@ export function validate(m) {
   return null;
 }
 
-// ------------------------------------------------------------------ edits
-
-export function addAtom(m, el, p, charge = 0) {
-  if (!isElement(el)) throw new Error(`Unknown element ${el}`);
-  const atom = { el, x: p[0], y: p[1], z: p[2], charge };
-  return { model: { atoms: [...m.atoms, atom], bonds: m.bonds }, index: m.atoms.length };
-}
-
-/** Add a bond; returns the same model if it already exists or is invalid. */
-export function addBond(m, a, b, order = 1) {
-  const n = m.atoms.length;
-  if (a === b || a < 0 || b < 0 || a >= n || b >= n || findBond(m, a, b) >= 0) return m;
-  return { atoms: m.atoms, bonds: [...m.bonds, { a, b, order }] };
-}
-
-export function setBondOrder(m, bi, order) {
-  if (!m.bonds[bi] || m.bonds[bi].order === order) return m;
-  const bonds = m.bonds.slice();
-  bonds[bi] = { ...bonds[bi], order };
-  return { atoms: m.atoms, bonds };
-}
-
-export function cycleBondOrder(m, bi) {
-  if (!m.bonds[bi]) return m;
-  return setBondOrder(m, bi, (m.bonds[bi].order % 3) + 1);
-}
-
-export function removeBond(m, bi) {
-  if (!m.bonds[bi]) return m;
-  return { atoms: m.atoms, bonds: m.bonds.filter((_, k) => k !== bi) };
-}
-
-/**
- * Hydrogens that would be left dangling if `indices` were deleted: H atoms
- * whose only neighbours are all in `indices`.
- */
-export function danglingHydrogens(m, indices) {
-  const doomed = new Set(indices);
-  const extra = [];
-  m.atoms.forEach((a, i) => {
-    if (a.el !== "H" || doomed.has(i)) return;
-    const nb = neighbors(m, i);
-    if (nb.length > 0 && nb.every((j) => doomed.has(j))) extra.push(i);
-  });
-  return extra;
-}
-
-/**
- * Delete atoms (and their bonds). Returns { model, map } where map[old] is the
- * new index of each atom, or -1 if it was deleted.
- */
-export function removeAtoms(m, indices) {
-  const doomed = new Set(indices);
-  if (doomed.size === 0) return { model: m, map: m.atoms.map((_, i) => i) };
-  const map = new Array(m.atoms.length).fill(-1);
-  const atoms = [];
-  m.atoms.forEach((a, i) => {
-    if (!doomed.has(i)) {
-      map[i] = atoms.length;
-      atoms.push(a);
-    }
-  });
-  const bonds = [];
-  for (const b of m.bonds) {
-    if (map[b.a] >= 0 && map[b.b] >= 0) bonds.push({ a: map[b.a], b: map[b.b], order: b.order });
-  }
-  return { model: { atoms, bonds }, map };
-}
-
-/** Delete atoms together with hydrogens that only hang on them. */
-export function removeAtomsWithHydrogens(m, indices) {
-  return removeAtoms(m, [...indices, ...danglingHydrogens(m, indices)]);
-}
-
-export function setElement(m, indices, el) {
-  if (!isElement(el)) throw new Error(`Unknown element ${el}`);
-  let changed = false;
-  const atoms = m.atoms.slice();
-  for (const i of indices) {
-    if (atoms[i] && atoms[i].el !== el) {
-      atoms[i] = { ...atoms[i], el };
-      changed = true;
-    }
-  }
-  return changed ? { atoms, bonds: m.bonds } : m;
-}
-
-export function changeCharge(m, indices, delta) {
-  let changed = false;
-  const atoms = m.atoms.slice();
-  for (const i of indices) {
-    if (!atoms[i]) continue;
-    const c = Math.max(-MAX_CHARGE, Math.min(MAX_CHARGE, (atoms[i].charge || 0) + delta));
-    if (c !== atoms[i].charge) {
-      atoms[i] = { ...atoms[i], charge: c };
-      changed = true;
-    }
-  }
-  return changed ? { atoms, bonds: m.bonds } : m;
-}
-
 /** Add all atoms and bonds of `other`, shifted by `offset`. */
 export function append(m, other, offset = [0, 0, 0]) {
   const base = m.atoms.length;
@@ -214,50 +105,6 @@ export function besideOffset(m, other, gap = 2.5) {
   const c1 = centroid(m);
   const c2 = centroid(other);
   return [maxX - minX + gap, c1[1] - c2[1], c1[2] - c2[2]];
-}
-
-// ------------------------------------------------------ drawing geometry
-
-const TETRAHEDRAL = (109.47 * Math.PI) / 180;
-
-function perpendicular(u, hint) {
-  // Component of `hint` perpendicular to unit vector `u`; any perpendicular if degenerate.
-  let p = vec.sub(hint, vec.scale(u, vec.dot(hint, u)));
-  if (vec.len(p) < 1e-3) {
-    const other = Math.abs(u[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
-    p = vec.cross(u, other);
-  }
-  return vec.norm(p);
-}
-
-/**
- * Direction for a new atom bonded to atom i, pointing away from its existing
- * neighbours. `view` gives the screen axes in model coordinates
- * ({right, up, toCamera}) so that new atoms appear where the user can see them.
- */
-export function newAtomDirection(m, i, view) {
-  const p = pos(m.atoms[i]);
-  const dirs = neighbors(m, i)
-    .map((j) => vec.norm(vec.sub(pos(m.atoms[j]), p)))
-    .filter((d) => vec.len(d) > 0.5);
-  if (dirs.length === 0) return vec.norm(view.right);
-  if (dirs.length === 1) {
-    const u = dirs[0];
-    const w = perpendicular(u, view.up);
-    return vec.norm(vec.add(vec.scale(u, Math.cos(TETRAHEDRAL)), vec.scale(w, Math.sin(TETRAHEDRAL))));
-  }
-  const sum = dirs.reduce((s, d) => vec.add(s, d), [0, 0, 0]);
-  if (vec.len(sum) > 0.2) return vec.norm(vec.scale(sum, -1));
-  // Neighbours cancel out (linear or planar-symmetric): go perpendicular to them.
-  let n = vec.cross(dirs[0], dirs[1]);
-  n = vec.len(n) > 0.1 ? vec.norm(n) : perpendicular(dirs[0], view.up);
-  return vec.dot(n, view.toCamera) < 0 ? vec.scale(n, -1) : n;
-}
-
-/** Position for a new `el` atom bonded to atom i. */
-export function newAtomPosition(m, i, el, view) {
-  const d = newAtomDirection(m, i, view);
-  return vec.add(pos(m.atoms[i]), vec.scale(d, bondLength(m.atoms[i].el, el)));
 }
 
 // ---------------------------------------------------------- measurements

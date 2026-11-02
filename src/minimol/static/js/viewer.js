@@ -411,6 +411,18 @@ export class Viewer {
     return { right: f(1, 0, 0), up: f(0, 1, 0), toCamera: f(0, 0, 1) };
   }
 
+  /** Indices of atoms whose centres project inside a client-space rectangle. */
+  atomsInRect(x0, y0, x1, y1) {
+    const [left, right] = [Math.min(x0, x1), Math.max(x0, x1)];
+    const [top, bottom] = [Math.min(y0, y1), Math.max(y0, y1)];
+    const out = [];
+    this.model.atoms.forEach((a, i) => {
+      const p = this.modelToClient([a.x, a.y, a.z]);
+      if (p.x >= left && p.x <= right && p.y >= top && p.y <= bottom) out.push(i);
+    });
+    return out;
+  }
+
   /** Client (CSS pixel) coordinates of a model point. */
   modelToClient(p) {
     this.pivot.updateMatrixWorld(true);
