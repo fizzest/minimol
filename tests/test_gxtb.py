@@ -44,6 +44,7 @@ def _fake_binary(tmp_path, name, help_text, script=""):
 @needs_sh
 def test_env_var_binary_must_support_gxtb(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(gxtb.gxtb_install, "installed_binary", lambda: None)  # nor a copy installed by the app
     plain = _fake_binary(tmp_path, "plain-xtb", "--gfn INT")
     monkeypatch.setenv(gxtb.ENV_VAR, plain)
     assert gxtb.find_binary(refresh=True) is None
