@@ -47,6 +47,12 @@ jobs:
           Get-Content selftest-built.json
           if ($p.ExitCode -ne 0) { throw "self-test of the built program failed (exit $($p.ExitCode))" }
 
+      - name: Self-test with software rendering (shows whether WebGL then works without a GPU)
+        continue-on-error: true
+        run: |
+          $p = Start-Process dist\minimol\minimol.exe -ArgumentList '--self-test', "$PWD\selftest-softwaregl.json", '--self-test-window', '--software-gl' -Wait -PassThru
+          Get-Content selftest-softwaregl.json
+
       - name: Build the installer (Inno Setup)
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
