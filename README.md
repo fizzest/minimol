@@ -198,3 +198,10 @@ npm run e2e                     # drives the editor in Chromium with real mouse/
 
 Orbitals and densities (IboView-style isosurfaces), ring-fusion hotkeys,
 periodic systems, conformer search, frequencies, solvent models.
+
+## License
+
+minimol is released under the MIT License (see [LICENSE](LICENSE)). It
+includes three.js (MIT, `src/minimol/static/vendor/three-LICENSE.txt`) and
+depends on RDKit (BSD-3-Clause) and PySide6 (LGPL-3.0). g-xTB (GPL-3.0) is
+not included; minimol only runs it as a separate program if you install it.
