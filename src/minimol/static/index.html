@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>minimol</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="module" src="/static/js/app.js"></script>
+</head>
+<body>
+  <header id="toolbar">
+    <div class="group">
+      <button id="btn-open" data-edit title="Open a molecule file (Ctrl+O)">Open…</button>
+      <input type="file" id="file-input" accept=".xyz,.mol,.sdf,.sd,.mol2,.pdb,.ent" hidden>
+      <button id="btn-save" title="Save (Ctrl+S)">Save</button>
+      <select id="save-format" title="File format for saving">
+        <option value="xyz">.xyz</option>
+        <option value="sdf">.sdf</option>
+        <option value="mol">.mol</option>
+        <option value="pdb">.pdb</option>
+      </select>
+    </div>
+    <div class="group">
+      <button id="btn-undo" data-edit title="Undo (Ctrl+Z)">Undo</button>
+      <button id="btn-redo" data-edit title="Redo (Ctrl+Shift+Z)">Redo</button>
+    </div>
+    <form id="smiles-form" class="group">
+      <input id="smiles" placeholder="SMILES, e.g. CC(=O)O" spellcheck="false" autocomplete="off" aria-label="SMILES">
+      <button type="submit" data-edit title="Build a 3D structure from SMILES and add it">Insert</button>
+    </form>
+    <div class="group">
+      <button id="btn-addh" data-edit title="Fill open valences with hydrogens">Add H</button>
+      <select id="method" title="Optimization method" aria-label="Optimization method"></select>
+      <label id="uhf-wrap" hidden title="Number of unpaired electrons for g-xTB (blank = automatic: singlet or doublet)">
+        unpaired e⁻ <input id="uhf" type="number" min="0" step="1" placeholder="auto">
+      </label>
+      <label title="Keep the selected atoms fixed during optimization">
+        <input type="checkbox" id="fix-selected"> fix selected
+      </label>
+      <button id="btn-opt" data-edit class="primary" title="Optimize the geometry">Optimize</button>
+    </div>
+    <div class="group">
+      <button id="btn-reset" title="Reset view (R)">Reset view</button>
+      <button id="btn-clear" data-edit title="Remove everything (undoable)">Clear</button>
+    </div>
+  </header>
+
+  <div id="main">
+    <aside id="sidebar">
+      <h3>Tool</h3>
+      <div id="tools" class="stack">
+        <button data-tool="select">Select <kbd>1</kbd></button>
+        <button data-tool="draw">Draw <kbd>2</kbd></button>
+        <button data-tool="delete">Delete <kbd>3</kbd></button>
+      </div>
+      <h3>Element</h3>
+      <div id="elements"></div>
+      <input id="element-other" placeholder="other: Fe, Si…" maxlength="3" spellcheck="false" aria-label="Other element">
+      <h3>Charge of selection</h3>
+      <div class="row">
+        <button id="btn-charge-minus" data-edit title="Decrease formal charge (−)">−</button>
+        <button id="btn-charge-plus" data-edit title="Increase formal charge (+)">+</button>
+      </div>
+      <details id="help">
+        <summary>Help</summary>
+        <ul>
+          <li><b>Rotate:</b> left-drag on empty space</li>
+          <li><b>Pan:</b> right-drag or Shift+drag</li>
+          <li><b>Zoom:</b> mouse wheel / pinch</li>
+          <li><b>Draw:</b> click empty space for a new atom; click an atom to grow a bond; drag from atom to atom to bond them; click an atom of another element to change it; click a bond to cycle single/double/triple</li>
+          <li><b>Delete:</b> click an atom or bond (an atom takes its hydrogens with it)</li>
+          <li><b>Select:</b> click atoms (Shift adds); 2/3/4 atoms show distance/angle/dihedral</li>
+          <li><b>Keys:</b> Ctrl+Z / Ctrl+Shift+Z undo/redo, Del delete selection, Ctrl+A select all, Esc clear selection, R reset view, H C N O F P S pick element</li>
+        </ul>
+      </details>
+    </aside>
+
+    <div id="viewport">
+      <div id="hint">Click to place an atom, drag from an atom to grow a bond,<br>open a file, or type a SMILES above.</div>
+      <div id="busy" hidden><div class="spinner"></div><span id="busy-text"></span></div>
+    </div>
+  </div>
+
+  <footer id="statusbar">
+    <span id="info"></span>
+    <span id="measure"></span>
+    <span id="energy"></span>
+    <span id="hover"></span>
+    <span id="message" role="status"></span>
+  </footer>
+</body>
+</html>
