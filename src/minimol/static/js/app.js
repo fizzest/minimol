@@ -68,7 +68,8 @@ try {
   window.minimolWebGLFailed = true;
   $("hint").textContent =
     `3D graphics (WebGL) could not start: ${err.message} ` +
-    "In the desktop app, try starting it with: minimol --software-gl";
+    "(The desktop app retries with software rendering by itself; " +
+    "in a web browser, check that hardware acceleration is turned on.)";
   throw err;
 }
 viewers[2] = new Viewer2D($("viewport"));

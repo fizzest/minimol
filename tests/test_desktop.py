@@ -223,3 +223,78 @@ def test_unreadable_clipboard_reports_formats(qapp, window):
     QTest.keyClick(window.view.focusProxy() or window.view, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
     expected = "binary CDX" if not clipboard.cdx_supported() else "Nothing on the clipboard"
     wait_for(qapp, lambda: expected in (js(qapp, window, "document.querySelector('#message').textContent") or ""))
+
+
+# ------------------------------------------- restart with software rendering
+
+
+def close_window(win):
+    win._close_confirmed = True
+    win.close()
+    win.deleteLater()
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def page(script):
+    """A stand-in for the editor page whose script sets the startup state."""
+    import urllib.parse
+
+    return "data:text/html," + urllib.parse.quote(f"<!doctype html><title>t</title><script>{script}</script>")
+
+
+def test_window_without_webgl_closes_to_restart_with_software_rendering(qapp):
+    win = desktop.create_window(page("window.minimolWebGLFailed = true;"), retry_with_software_gl=True)
+    win.show()
+    try:
+        wait_for(qapp, lambda: win.wants_software_gl, timeout=30)
+        assert win.page is None  # the window closed itself
+    finally:
+        close_window(win)
+
+
+def test_window_already_in_software_mode_does_not_restart_again(qapp, tmp_path, monkeypatch):
+    report = tmp_path / "ready.json"
+    monkeypatch.setenv(desktop.READY_REPORT_ENV, str(report))
+    win = desktop.create_window(page("window.minimolWebGLFailed = true;"), software_gl=True)
+    win.show()
+    try:
+        wait_for(qapp, report.exists, timeout=30)
+        result = json.loads(report.read_text())
+        assert (result["state"], result["software_gl"], result["pid"]) == ("no-webgl", True, os.getpid())
+        assert not win.wants_software_gl
+    finally:
+        close_window(win)
+
+
+def test_ready_report_once_the_real_editor_has_started(qapp, tmp_path, monkeypatch):
+    report = tmp_path / "ready.json"
+    monkeypatch.setenv(desktop.READY_REPORT_ENV, str(report))
+    server = make_server("127.0.0.1", 0, None)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    win = desktop.create_window(server.url, software_gl=True, retry_with_software_gl=False)
+    win.show()
+    try:
+        wait_for(qapp, report.exists, timeout=60)
+        assert json.loads(report.read_text())["state"] == "ready"
+    finally:
+        close_window(win)
+        server.shutdown()
+        server.server_close()
+
+
+def test_program_started_normally_opens_the_editor(tmp_path):
+    """The whole program in its own process; without a usable GPU it restarts itself once."""
+    import subprocess
+    import sys
+
+    molecule = tmp_path / "water.xyz"
+    molecule.write_text("3\nwater\nO 0 0 0\nH 0.96 0 0\nH -0.24 0.93 0\n")
+    report = tmp_path / "ready.json"
+    env = {k: v for k, v in os.environ.items() if k not in ("MINIMOL_SOFTWARE_GL", "QTWEBENGINE_CHROMIUM_FLAGS")}
+    env.update({desktop.READY_REPORT_ENV: str(report), "QT_QPA_PLATFORM": os.environ.get("QT_QPA_PLATFORM", "offscreen")})
+    done = subprocess.run([sys.executable, "-m", "minimol", str(molecule)], env=env, timeout=180, capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr[-2000:]
+    result = json.loads(report.read_text())
+    assert result["state"] == "ready", result
+    assert result["args"][-1] == str(molecule)  # the restarted copy (if any) got the file too
+    print("restarted with software rendering:", result["software_gl"])

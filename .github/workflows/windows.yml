@@ -47,11 +47,22 @@ jobs:
           Get-Content selftest-built.json
           if ($p.ExitCode -ne 0) { throw "self-test of the built program failed (exit $($p.ExitCode))" }
 
-      - name: Self-test with software rendering (shows whether WebGL then works without a GPU)
-        continue-on-error: true
+      - name: Start the program normally (without a GPU it must restart itself with software rendering)
         run: |
-          $p = Start-Process dist\minimol\minimol.exe -ArgumentList '--self-test', "$PWD\selftest-softwaregl.json", '--self-test-window', '--software-gl' -Wait -PassThru
-          Get-Content selftest-softwaregl.json
+          $mol = Join-Path $env:RUNNER_TEMP 'my molecule.xyz'
+          Set-Content -Path $mol -Value "3`nwater`nO 0 0 0`nH 0.96 0 0`nH -0.24 0.93 0"
+          $env:MINIMOL_READY_REPORT = "$PWD\ready.json"
+          Start-Process dist\minimol\minimol.exe -ArgumentList "`"$mol`""
+          for ($i = 0; $i -lt 180 -and -not (Test-Path ready.json); $i++) { Start-Sleep -Seconds 1 }
+          if (-not (Test-Path ready.json)) { throw "the program did not report that the editor started" }
+          Get-Content ready.json
+          $r = Get-Content ready.json | ConvertFrom-Json
+          if ($r.state -ne 'ready') { throw "the editor did not start: $($r.state)" }
+          if ($r.args[-1] -ne $mol) { throw "the molecule file did not reach the editor: $($r.args -join ' | ')" }
+          $built = Get-Content selftest-built.json | ConvertFrom-Json
+          if (-not $built.checks.window.detail.webgl -and -not $r.software_gl) { throw "WebGL failed but the program did not restart with software rendering" }
+          for ($i = 0; $i -lt 60 -and (Get-Process minimol -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Seconds 1 }
+          if (Get-Process minimol -ErrorAction SilentlyContinue) { throw "minimol is still running after closing its window" }
 
       - name: Build the installer (Inno Setup)
         run: |

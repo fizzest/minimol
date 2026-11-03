@@ -101,10 +101,7 @@ def _window(software_gl: bool) -> dict:
     deadline = time.time() + 90
     try:
         while time.time() < deadline and "state" not in answer:
-            win.js(
-                "window.__minimol ? 'ready' : (window.minimolWebGLFailed ? 'no-webgl' : 'loading')",
-                lambda v: answer.__setitem__("last", v),
-            )
+            win.js(desktop.PROBE_JS, lambda v: answer.__setitem__("last", v))
             for _ in range(20):
                 app.processEvents()
                 time.sleep(0.01)

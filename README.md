@@ -50,11 +50,14 @@ minimol molecule.xyz       # open a file straight away
 * `--browser` uses your web browser instead of the window. Ctrl+R optimizes
   there too in Chromium (tested); other browsers may reload the page instead,
   so use the Optimize button.
-* `--software-gl` lets the window draw without a usable GPU (virtual
-  machines, remote desktops, WSL). Use it if the window says 3D graphics could
-  not start. On Linux without `/dev/dri` it also turns off Chromium's GPU
-  compositor, which otherwise leaves the window blank. This was verified on
-  Linux only.
+* Without a usable GPU (virtual machines, some remote desktops, blocked
+  graphics drivers) the 3D view cannot start. The window notices and restarts
+  minimol once with software rendering, so it opens a second or two later.
+  This was tested on GitHub's GPU-less Windows machines and on Linux without
+  a GPU, not on a real PC with a broken driver.
+* `--software-gl` starts in software rendering straight away. On Linux
+  without `/dev/dri` it also turns off Chromium's GPU compositor, which
+  otherwise leaves the window blank (WSL).
 * `--self-test report.json` checks an installation (chemistry, the editor's
   files, and with `--self-test-window` the window itself) and writes a report.
 
@@ -322,7 +325,9 @@ GitHub's Windows machines.
 * The program is built with PyInstaller (`packaging/minimol.spec`) and the
   installer with Inno Setup (`packaging/windows/minimol.iss`).
 * The program is self-tested, window included, both as built and after a
-  silent install, and the uninstaller is checked.
+  silent install, and the uninstaller is checked. It is also started
+  normally to check the automatic restart with software rendering (GitHub's
+  Windows machines have no GPU).
 * To build by hand on Windows:
 
   ```bash
