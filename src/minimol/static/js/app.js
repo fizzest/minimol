@@ -35,6 +35,7 @@ const state = {
   fileName: "molecule",
   saved: null, // model last saved or opened
   keepH: loadSetting("keepH", true),
+  dehydro: loadSetting("dehydro", true), // Conjugate may take hydrogens off ring carbons
   hotkeys: loadSetting("hotkeys", true),
   fragments: new Map(), // key -> {name, mode}
   bondKeys: new Map(), // key -> {op, order | size, aromatic}
@@ -300,6 +301,18 @@ async function insertSmiles(smiles) {
   showNotes(r.notes, `Inserted ${smiles}.`);
 }
 
+/** Make the selected atoms (or everything) as conjugated as possible. */
+async function conjugate() {
+  if (model().atoms.length === 0) return;
+  const op = { type: "conjugate", dehydro: state.dehydro };
+  if (state.selection.length) op.atoms = state.selection;
+  const r = await serverEdit(op);
+  if (!r) return;
+  // These notes are information, not warnings. The bonds changed but the atoms did not move.
+  const hint = dim() === 3 && r.notes.some((n) => n.startsWith("Conjugated")) ? " Press Ctrl+R to relax the geometry." : "";
+  setMessage(r.notes.join(" ") + hint);
+}
+
 async function addHydrogens() {
   if (!canEdit() || dim() === 2) return;
   const m = model();
@@ -534,12 +547,13 @@ function updateUI() {
   $("element-other").classList.toggle("active", !QUICK_ELEMENTS.includes(state.element));
   $("viewport").className = `tool-${state.tool}`;
   $("keep-h").checked = state.keepH;
+  $("conj-dehydro").checked = state.dehydro;
   $("hotkeys").checked = state.hotkeys;
   $("mode-3d").classList.toggle("active", !flat);
   $("mode-2d").classList.toggle("active", flat);
 
   const locked = state.busy && !$("busy").hidden;
-  for (const el of document.querySelectorAll("[data-edit], #method, #uhf, #fix-selected, #smiles, #element-other, #keep-h")) {
+  for (const el of document.querySelectorAll("[data-edit], #method, #uhf, #fix-selected, #smiles, #element-other, #keep-h, #conj-dehydro")) {
     el.disabled = locked;
   }
   if (!locked) {
@@ -792,6 +806,7 @@ window.addEventListener("keydown", (e) => {
       y: redo,
       s: save,
       r: optimize,
+      k: conjugate,
       c: () => copySelection(),
       x: () => copySelection({ cut: true }),
       v: paste,
@@ -886,6 +901,7 @@ $("smiles-form").addEventListener("submit", (e) => {
   insertSmiles($("smiles").value);
 });
 $("btn-addh").addEventListener("click", addHydrogens);
+$("btn-conj").addEventListener("click", conjugate);
 $("btn-opt").addEventListener("click", optimize);
 for (const id of ["method", "save-format"]) {
   $(id).addEventListener("change", (e) => {
@@ -901,6 +917,10 @@ $("btn-clear").addEventListener("click", () => {
 });
 $("btn-charge-minus").addEventListener("click", () => changeCharge(state.selection, -1));
 $("btn-charge-plus").addEventListener("click", () => changeCharge(state.selection, +1));
+$("conj-dehydro").addEventListener("change", (e) => {
+  state.dehydro = e.target.checked;
+  saveSetting("dehydro", state.dehydro);
+});
 $("keep-h").addEventListener("change", (e) => {
   state.keepH = e.target.checked;
   saveSetting("keepH", state.keepH);
@@ -1015,6 +1035,7 @@ window.__minimol = {
   },
   model,
   commit,
+  setSelection,
   M,
 };
 

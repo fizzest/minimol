@@ -35,6 +35,7 @@
     </form>
     <div class="group">
       <button id="btn-addh" data-edit title="Fill every open valence with hydrogens">Add H</button>
+      <button id="btn-conj" data-edit title="Make the molecule (or the selected atoms) as conjugated as possible: aromatize rings, rearrange double bonds (Ctrl+K)">Conjugate</button>
       <select id="method" title="Optimization method" aria-label="Optimization method"></select>
       <button id="btn-gxtb" data-edit hidden title="Download g-xTB from github.com/grimme-lab/g-xtb and install it for minimol">Install g-xTB…</button>
       <label id="uhf-wrap" hidden title="Number of unpaired electrons for g-xTB (blank = automatic: singlet or doublet)">
@@ -71,6 +72,9 @@
       <label class="option" title="New atoms come with hydrogens, and edited atoms keep the right number of hydrogens">
         <input type="checkbox" id="keep-h" checked> Keep hydrogens
       </label>
+      <label class="option" title="Conjugate may take hydrogens off ring carbons (cyclohexane becomes benzene). Off: only double bonds move; no hydrogen changes. Hydrogens on N, O, chains and methyl groups never change.">
+        <input type="checkbox" id="conj-dehydro" checked> Conjugate removes ring H
+      </label>
       <label class="option" title="Hover an atom or bond and press a key to add a group (ChemDraw-style)">
         <input type="checkbox" id="hotkeys" checked> Fragment hotkeys
       </label>
@@ -98,7 +102,7 @@
           <li><b>Delete:</b> right-click an atom or bond (Draw or Delete tool), or click it with the Delete tool</li>
           <li><b>Select:</b> Ctrl+drag a box (Ctrl+Shift+drag adds); Ctrl+click toggles one atom; with the Select tool, click (Shift adds). 2/3/4 atoms show distance/angle/dihedral</li>
           <li><b>Clipboard:</b> Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste structures (with ChemDraw too; see the README for formats)</li>
-          <li><b>Keys:</b> Ctrl+R optimize (3D) or clean up (2D), Ctrl+Z / Ctrl+Shift+Z undo/redo, Del delete, Ctrl+A select all, Esc clear selection, R reset view</li>
+          <li><b>Keys:</b> Ctrl+R optimize (3D) or clean up (2D), Ctrl+K conjugate, Ctrl+Z / Ctrl+Shift+Z undo/redo, Del delete, Ctrl+A select all, Esc clear selection, R reset view</li>
         </ul>
       </details>
     </aside>

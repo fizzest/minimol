@@ -102,6 +102,27 @@ whose `--help` lists `--gxtb`. It runs
 temporary folder; atoms marked "fix selected" become an xcontrol `$fix` block.
 Tested with g-xTB 2.0.1 (xtb 6.7.1, built 2026-05-14) on Linux x86-64.
 
+**Checks before a g-xTB run.** g-xTB only sees elements, positions and the
+total charge, so minimol looks at those first (the thresholds are minimol's
+own rules of thumb, not published limits):
+
+* Atoms closer than 0.5 Å that are not bonded: the run is refused.
+* Non-bonded atoms closer than 0.6 × the sum of their van der Waals radii
+  (for example H–H at 1.05 Å, C–H at 1.41 Å), and bonds shorter than 0.70 ×
+  or longer than 1.30 × the sum of the covalent radii: a warning with the
+  worst pairs. Such starting geometries often do not converge; choose UFF or
+  MMFF94 in the method menu first and run g-xTB afterwards. If g-xTB then
+  fails or times out anyway, the warnings are added to its error message.
+* An odd number of electrons (the sum of the atomic numbers minus the total
+  charge): there is no closed-shell state, so g-xTB would run a doublet. The
+  warning names atoms with open valences (a missing hydrogen or bond is the
+  usual cause) and says to change the total charge by ±1 or to set the
+  unpaired electrons on purpose.
+
+This cannot know which of several chemically possible fixes you want (for
+example whether a ring CH2 should become an sp² CH); use **Conjugate** (below)
+or edit the atom yourself.
+
 ## Using it
 
 ### Mouse
@@ -124,6 +145,7 @@ Tested with g-xTB 2.0.1 (xtb 6.7.1, built 2026-05-14) on Linux x86-64.
 | --- | --- |
 | **Ctrl+R** | optimize the geometry (3D) / clean up the drawing (2D) |
 | **Tab** | switch between 3D and 2D |
+| **Ctrl+K** | Conjugate: make everything (or the selected atoms) as conjugated as possible |
 | Ctrl+C / Ctrl+X / Ctrl+V | copy, cut, paste structures (see Clipboard) |
 | Ctrl+Z / Ctrl+Shift+Z (Ctrl+Y) | undo / redo |
 | Delete | delete the selection, or the atom/bond under the mouse |
@@ -198,6 +220,34 @@ and a skeletal drawing:
 * **Switching straight back without editing** restores the exact previous
   drawing or 3D structure.
 * **Undo/redo** works across switches.
+
+### Conjugate (aromatize as much as possible)
+
+The **Conjugate** button (Ctrl+K) re-assigns which bonds are double so that
+as many atoms as possible sit in exactly one double bond. This is a maximum
+matching on the conjugatable atoms, so alternating (Kekulé) structures of even
+very large polycyclic systems come out right, and a wrong or half-drawn
+double-bond pattern is repaired. It works on the selected atoms, or on
+everything when nothing is selected.
+
+* Triple bonds, bonds to atoms outside the selection, and atoms with no room
+  for a double bond (sp³ carbons with four neighbours, N with three, S in
+  thiophene, ...) are left alone. Bonds that are already double are kept
+  where possible.
+* **Conjugate removes ring H** (on by default): a *ring carbon* may lose
+  hydrogens to join the system, so cyclohexane becomes benzene and tetralin
+  becomes naphthalene. Hydrogens on N, O, methyl groups and chains never
+  change, so N–H of pyrrole and phenol O–H stay. Turn the option off to only
+  move double bonds without changing any hydrogen count.
+* If the atoms cannot all be paired (an odd number of conjugated atoms), the
+  leftover atom stays as it is. When it has a free valence the message names
+  it as a radical centre, which is also why the electron count can be odd.
+* Limits: it works on the graph only, so it does not know about ring
+  strain or geometry. Selecting a bicyclic cage such as bicyclo[2.2.2]octane
+  with the option on gives bridgehead double bonds that cannot exist, so
+  select only the part you want. Neutral borazine is left alone because its
+  alternating B=N double bonds would need charges. Atoms without a fixed valence
+  (metals) are skipped. The geometry is not changed; run Optimize afterwards.
 
 ### Hydrogens
 

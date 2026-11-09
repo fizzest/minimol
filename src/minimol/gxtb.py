@@ -39,7 +39,7 @@ import subprocess
 import tempfile
 import threading
 
-from . import gxtb_install
+from . import check, gxtb_install
 from .chem import ChemError, validate_json
 
 ENV_VAR = "MINIMOL_GXTB"
@@ -144,6 +144,10 @@ def optimize(
                 f"{uhf} unpaired electron(s) is impossible with {electrons} electrons "
                 f"(total charge {charge})"
             )
+    problems = check.preflight(data, charge, uhf)
+    if problems["errors"]:
+        raise ChemError(" ".join(problems["errors"]))
+    hints = " ".join(problems["warnings"])
     if level not in OPT_LEVELS:
         raise ChemError(f"Optimization level must be one of {', '.join(OPT_LEVELS)}")
     if max_cycles is not None:
@@ -192,7 +196,7 @@ def optimize(
                     **_NO_WINDOW,
                 )
         except subprocess.TimeoutExpired:
-            raise ChemError(f"g-xTB did not finish within {timeout:g} seconds") from None
+            raise ChemError(f"g-xTB did not finish within {timeout:g} seconds. {hints}".strip()) from None
         except OSError as exc:
             raise ChemError(f"Could not run g-xTB ({binary}): {exc}") from None
         with open(log_path, errors="replace") as fh:
@@ -200,7 +204,7 @@ def optimize(
 
         out_path = os.path.join(work, "xtbopt.xyz")
         if proc.returncode != 0 or not os.path.exists(out_path):
-            raise ChemError("g-xTB failed: " + _error_message(log_text, proc.returncode))
+            raise ChemError(" ".join(["g-xTB failed: " + _error_message(log_text, proc.returncode), hints]).strip())
         with open(out_path) as fh:
             optimized, energy, gnorm = _read_xtbopt(fh.read(), atoms)
 
@@ -208,6 +212,7 @@ def optimize(
     notes = []
     if not converged:
         notes.append("g-xTB did not converge within the cycle limit; run Optimize again to continue.")
+    notes.extend(problems["warnings"])
     initial = _initial_energy(log_text)
     molecule = {
         "atoms": [

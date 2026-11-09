@@ -546,3 +546,37 @@ test("clipboard: copy gives SMILES text, paste reads SMILES in 3D and 2D", async
   assert.deepEqual(h.errors, []);
   await page.close();
 });
+
+test("conjugate: button and Ctrl+K aromatize, only the selection changes, the option keeps hydrogens, undo restores", async () => {
+  const h = await openEditor();
+  const { page } = h;
+  await page.fill("#smiles", "C1CCCCC1C1CCCCC1");
+  await page.press("#smiles", "Enter");
+  await h.waitFormula("C12H22");
+
+  // Select the six atoms of the first ring and press the button: only that ring becomes benzene.
+  await page.evaluate(() => window.__minimol.setSelection?.([0, 1, 2, 3, 4, 5]));
+  const selected = await page.evaluate(() => window.__minimol.state.selection.length);
+  assert.equal(selected, 6, "the test needs the app to expose setSelection");
+  await page.click("#btn-conj");
+  await h.waitFormula("C12H16");
+  assert.match(await h.text("#message"), /Conjugated: 3 bond/);
+
+  // Ctrl+K with nothing selected conjugates everything: biphenyl.
+  await page.evaluate(() => window.__minimol.setSelection([]));
+  await page.keyboard.press("Control+k");
+  await h.waitFormula("C12H10");
+  assert.equal((await h.model()).bonds.filter((b) => b.order === 2).length, 6);
+
+  // Undo goes back step by step.
+  await page.keyboard.press("Control+z");
+  await h.waitFormula("C12H16");
+
+  // With "Conjugate removes ring H" off, saturated rings stay as they are.
+  await page.uncheck("#conj-dehydro");
+  await page.keyboard.press("Control+k");
+  await h.idle();
+  assert.equal(await h.formula(), "C12H16");
+  assert.match(await h.text("#message"), /Already as conjugated/);
+  assert.deepEqual(h.errors, []);
+});

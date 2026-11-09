@@ -43,6 +43,7 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import rdDepictor, rdDistGeom
 
+from . import conjugate as conjugation
 from . import layout
 from .chem import ChemError, _atomic_number, _integer, _relax, mol_from_json, mol_to_json
 
@@ -734,6 +735,9 @@ def apply_edit(data: object, op: object, keep_h: object = True, view: object = N
     elif kind == "fuse":
         _fuse(s, op, hint)
 
+    elif kind == "conjugate":
+        _conjugate(s, op)
+
     elif kind == "charge":
         atoms = op.get("atoms")
         delta = _integer(op.get("delta"), "delta")
@@ -839,6 +843,141 @@ def _fragment(s: Session, op: dict, hint: np.ndarray | None) -> None:
         # Inside a chain or ring a larger group cannot take the atom's place; add it as a substituent.
         attach_to(t)
         s.notes.append(f"{frag.name} was added to {s.el(t)}{t + 1} as a substituent (the atom is inside a chain or ring).")
+
+
+def _valence_for(el: int, charge: int, used: int) -> int | None:
+    """The smallest normal valence of the atom (adjusted for its charge) that can hold ``used`` bonds."""
+    effective = el - charge  # a cation has one electron fewer: like the element before it
+    if not 1 <= effective <= 118:
+        effective = el
+    valences = list(_PT.GetValenceList(effective))
+    if not valences or -1 in valences:
+        return None  # no fixed valence (metals): leave alone
+    fitting = [v for v in valences if v >= used]
+    return min(fitting) if fitting else None
+
+
+def _conjugate(s: Session, op: dict) -> None:
+    """Make the molecule as conjugated as possible: a Kekulé assignment with the most double bonds.
+
+    Works on the chosen atoms (``atoms``; default: all). Only single and
+    double bonds between heavy atoms are re-assigned; triple bonds, bonds to
+    atoms outside the choice and bonds of atoms that cannot take a double bond
+    stay as they are. With ``dehydro`` (default) a ring carbon may lose its
+    hydrogens to join the conjugated system (cyclohexane becomes benzene);
+    hydrogens on other atoms (N-H, O-H, CH3, chains) never change.
+    """
+    dehydro = op.get("dehydro", True)
+    if not isinstance(dehydro, bool):
+        raise ChemError("dehydro must be true or false")
+    chosen = op.get("atoms")
+    if chosen is not None and not isinstance(chosen, list):
+        raise ChemError("atoms must be a list of atom indices")
+    heavy = [i for i in range(s.mol.GetNumAtoms()) if not s.is_h(i)]
+    scope = {s.check_atom(x) for x in chosen} & set(heavy) if chosen else set(heavy)
+    if not scope:
+        raise ChemError("Nothing to conjugate: no non-hydrogen atoms")
+
+    probe = Chem.RWMol(s.mol)
+    probe.UpdatePropertyCache(strict=False)
+    in_ring = {i for ring in Chem.GetSymmSSSR(probe) for i in ring}
+
+    def order_of(bond) -> int:
+        return _ORDER_OF.get(bond.GetBondType(), 1)
+
+    def heavy_bonds(i: int):
+        return [b for b in s.mol.GetAtomWithIdx(i).GetBonds() if not s.is_h(b.GetOtherAtomIdx(i))]
+
+    def current_h(i: int) -> int:
+        atom = s.mol.GetAtomWithIdx(i)
+        explicit = sum(1 for n in atom.GetNeighbors() if n.GetAtomicNum() == 1)
+        if not s.flat:
+            return explicit  # 3D: hydrogens are atoms
+        used = sum(order_of(b) for b in atom.GetBonds())
+        valence = _valence_for(atom.GetAtomicNum(), atom.GetFormalCharge(), used)
+        return explicit + (valence - used if valence is not None else 0)  # 2D: implicit hydrogens fill the valence
+
+    hydrogens = {i: current_h(i) for i in scope}
+    removable = {
+        i
+        for i in scope
+        if dehydro and s.mol.GetAtomWithIdx(i).GetAtomicNum() == 6 and i in in_ring
+    }
+
+    def spare(i: int, fixed_pi: int) -> int:
+        """How many more bonds atom i could make through a double bond, keeping its hydrogens (unless removable)."""
+        atom = s.mol.GetAtomWithIdx(i)
+        keep = 0 if i in removable else hydrogens[i]
+        used = len(heavy_bonds(i)) + fixed_pi + keep
+        valence = _valence_for(atom.GetAtomicNum(), atom.GetFormalCharge(), used)
+        return 0 if valence is None else valence - used
+
+    # Bonds between two chosen atoms are re-assigned; the rest keep their order.
+    # An atom that cannot take a double bond makes its bonds fixed, which can
+    # in turn use up a neighbour's capacity, so repeat until nothing changes.
+    eligible = set(scope)
+    while True:
+        fixed_pi = {i: 0 for i in eligible}
+        for i in eligible:
+            for b in heavy_bonds(i):
+                j = b.GetOtherAtomIdx(i)
+                if not (j in eligible and order_of(b) <= 2):
+                    fixed_pi[i] += order_of(b) - 1
+        smaller = {i for i in eligible if spare(i, fixed_pi[i]) >= 1}
+        if smaller == eligible:
+            break
+        eligible = smaller
+    edges = []
+    for i in sorted(eligible):
+        for b in heavy_bonds(i):
+            j = b.GetOtherAtomIdx(i)
+            if i < j and j in eligible and order_of(b) <= 2:
+                edges.append((i, j))
+    index = {atom: k for k, atom in enumerate(sorted(eligible))}
+    atom_of = {k: atom for atom, k in index.items()}
+    current = [
+        (index[i], index[j]) for i, j in edges if order_of(s.mol.GetBondBetweenAtoms(i, j)) == 2
+    ]
+    mate = conjugation.max_matching(len(index), [(index[i], index[j]) for i, j in edges], current)
+
+    pi_before = {i: sum(order_of(b) - 1 for b in heavy_bonds(i)) for i in scope}
+    changed = 0
+    for i, j in edges:
+        want = 2 if mate[index[i]] == index[j] else 1
+        bond = s.mol.GetBondBetweenAtoms(i, j)
+        if order_of(bond) != want:
+            bond.SetBondType(_ORDER[want])
+            changed += 1
+    touched = [i for i in scope if sum(order_of(b) - 1 for b in heavy_bonds(i)) != pi_before[i]]
+    if not s.flat:  # 3D hydrogens are atoms: re-derive them on every atom whose bonding changed
+        for i in touched:
+            s.mol.GetAtomWithIdx(i).SetIntProp(ADJUST, 1)
+
+    doubles = sum(1 for i, j in edges if mate[index[i]] == index[j])
+    if changed:
+        s.notes.append(f"Conjugated: {changed} bond(s) changed, {doubles} double bond(s) in the conjugated part.")
+    else:
+        s.notes.append("Already as conjugated as it can be.")
+    lone = [
+        atom_of[k]
+        for k in range(len(index))
+        if mate[k] == -1 and atom_of[k] not in removable and spare(atom_of[k], fixed_pi[atom_of[k]]) >= 1
+    ]
+    if lone:
+        names = ", ".join(f"{s.el(i)}{i + 1}" for i in lone[:6]) + (", ..." if len(lone) > 6 else "")
+        s.notes.append(f"{names} cannot get a double-bond partner and stay open-valence (radical) centres.")
+    removed_from = 0
+    removed = 0
+    for i in touched:
+        if i in removable:
+            used = sum(order_of(b) for b in heavy_bonds(i))
+            valence = _valence_for(s.mol.GetAtomWithIdx(i).GetAtomicNum(), s.mol.GetAtomWithIdx(i).GetFormalCharge(), used)
+            fewer = hydrogens[i] - (0 if valence is None else valence - used)
+            if fewer > 0:
+                removed_from += 1
+                removed += fewer
+    if removed:
+        s.notes.append(f"Removed {removed} hydrogen(s) from {removed_from} ring atom(s) to extend the conjugation.")
 
 
 def _fuse(s: Session, op: dict, hint: np.ndarray | None) -> None:
